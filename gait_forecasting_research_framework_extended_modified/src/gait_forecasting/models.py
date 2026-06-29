@@ -1,19 +1,53 @@
-
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-import torch
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
 
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _amp_enabled() -> bool:
+    return torch.cuda.is_available()
+
+
+@contextlib.contextmanager
+def _autocast_ctx():
+    if _amp_enabled():
+        with autocast():
+            yield
+    else:
+        yield
+
+
+def _to_tensor(x: np.ndarray, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    return torch.as_tensor(x, dtype=dtype, device=device)
+
+
+def _to_numpy(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Sklearn baselines (CPU — unchanged interface)
+# ---------------------------------------------------------------------------
 
 def make_rf(random_state: int = 42) -> RandomForestClassifier:
     return RandomForestClassifier(
@@ -27,31 +61,47 @@ def make_rf(random_state: int = 42) -> RandomForestClassifier:
     )
 
 
-def make_sklearn_mlp(hidden_layers: Sequence[int] = (128, 64), random_state: int = 42) -> Pipeline:
+def make_sklearn_mlp(
+    hidden_layers: Sequence[int] = (128, 64),
+    random_state: int = 42,
+) -> Pipeline:
     return Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("mlp", MLPClassifier(
-                hidden_layer_sizes=tuple(hidden_layers),
-                activation="relu",
-                solver="adam",
-                alpha=1e-4,
-                batch_size=256,
-                learning_rate_init=1e-3,
-                max_iter=300,
-                random_state=random_state,
-                early_stopping=True,
-                n_iter_no_change=10,
-                validation_fraction=0.15,
-            )),
+            (
+                "mlp",
+                MLPClassifier(
+                    hidden_layer_sizes=tuple(hidden_layers),
+                    activation="relu",
+                    solver="adam",
+                    alpha=1e-4,
+                    batch_size=256,
+                    learning_rate_init=1e-3,
+                    max_iter=300,
+                    random_state=random_state,
+                    early_stopping=True,
+                    n_iter_no_change=10,
+                    validation_fraction=0.15,
+                ),
+            ),
         ]
     )
 
 
+# ---------------------------------------------------------------------------
+# Torch model definitions
+# ---------------------------------------------------------------------------
+
 class TorchMLP(nn.Module):
-    def __init__(self, input_dim: int, n_classes: int, hidden_sizes=(128, 64), dropout: float = 0.2):
+    def __init__(
+        self,
+        input_dim: int,
+        n_classes: int,
+        hidden_sizes: Sequence[int] = (128, 64),
+        dropout: float = 0.2,
+    ):
         super().__init__()
-        layers = []
+        layers: list[nn.Module] = []
         prev = input_dim
         for h in hidden_sizes:
             layers.extend([nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)])
@@ -59,12 +109,20 @@ class TorchMLP(nn.Module):
         layers.append(nn.Linear(prev, n_classes))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 class TorchGRUClassifier(nn.Module):
-    def __init__(self, input_dim: int, n_classes: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2, bidirectional: bool = False):
+    def __init__(
+        self,
+        input_dim: int,
+        n_classes: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        bidirectional: bool = False,
+    ):
         super().__init__()
         self.gru = nn.GRU(
             input_size=input_dim,
@@ -80,14 +138,20 @@ class TorchGRUClassifier(nn.Module):
             nn.Linear(out_dim, n_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.gru(x)
-        feat = out[:, -1]
-        return self.head(feat)
+        return self.head(out[:, -1])
 
 
 class TorchBiLSTMClassifier(nn.Module):
-    def __init__(self, input_dim: int, n_classes: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
+    def __init__(
+        self,
+        input_dim: int,
+        n_classes: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -103,14 +167,20 @@ class TorchBiLSTMClassifier(nn.Module):
             nn.Linear(out_dim, n_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
-        feat = out[:, -1]
-        return self.head(feat)
+        return self.head(out[:, -1])
 
 
 class _TCNBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int, dropout: float):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+    ):
         super().__init__()
         padding = (kernel_size - 1) * dilation
         self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
@@ -119,23 +189,24 @@ class _TCNBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.downsample(x)
-        y = self.conv1(x)
-        y = y[..., : residual.shape[-1]]
-        y = self.relu(y)
-        y = self.dropout(y)
-        y = self.conv2(y)
-        y = y[..., : residual.shape[-1]]
-        y = self.relu(y)
-        y = self.dropout(y)
+        y = self.relu(self.dropout(self.conv1(x)[..., : residual.shape[-1]]))
+        y = self.relu(self.dropout(self.conv2(y)[..., : residual.shape[-1]]))
         return self.relu(y + residual)
 
 
 class TorchTCNClassifier(nn.Module):
-    def __init__(self, input_dim: int, n_classes: int, channels: Sequence[int] = (64, 64, 64), kernel_size: int = 3, dropout: float = 0.2):
+    def __init__(
+        self,
+        input_dim: int,
+        n_classes: int,
+        channels: Sequence[int] = (64, 64, 64),
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+    ):
         super().__init__()
-        blocks = []
+        blocks: list[nn.Module] = []
         prev = input_dim
         for i, ch in enumerate(channels):
             blocks.append(_TCNBlock(prev, ch, kernel_size=kernel_size, dilation=2 ** i, dropout=dropout))
@@ -148,12 +219,14 @@ class TorchTCNClassifier(nn.Module):
             nn.Linear(prev, n_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C) -> (B, C, T)
-        x = x.transpose(1, 2)
-        y = self.tcn(x)
-        return self.head(y)
+        return self.head(self.tcn(x.transpose(1, 2)))
 
+
+# ---------------------------------------------------------------------------
+# Training result
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TorchTrainResult:
@@ -161,19 +234,59 @@ class TorchTrainResult:
     best_val_loss: float
 
 
-def _sequence_model_input(x: np.ndarray) -> np.ndarray:
-    if x.ndim != 3:
-        raise ValueError("Sequence models expect input shaped (N, T, C)")
-    return x
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
+def _make_loaders(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[DataLoader, DataLoader]:
+    # Pin memory only when CUDA is available so transfers are async
+    pin = device.type == "cuda"
 
-def _make_loaders(X_train, y_train, X_val, y_val, batch_size: int):
-    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-    val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    def _ds(X: np.ndarray, y: np.ndarray) -> TensorDataset:
+        return TensorDataset(
+            torch.as_tensor(X, dtype=torch.float32),
+            torch.as_tensor(y, dtype=torch.long),
+        )
+
+    train_loader = DataLoader(
+        _ds(X_train, y_train),
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=pin,
+        num_workers=0,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        _ds(X_val, y_val),
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=pin,
+        num_workers=0,
+        persistent_workers=False,
+    )
     return train_loader, val_loader
 
+
+def _maybe_compile(model: nn.Module) -> nn.Module:
+    """Apply torch.compile when supported (PyTorch >= 2.0, CUDA available)."""
+    if _amp_enabled() and hasattr(torch, "compile"):
+        try:
+            return torch.compile(model)
+        except Exception:
+            pass
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Core training loop
+# ---------------------------------------------------------------------------
 
 def _train_torch_classifier(
     model: nn.Module,
@@ -187,33 +300,44 @@ def _train_torch_classifier(
     weight_decay: float = 1e-4,
     patience: int = 8,
     random_state: int = 42,
-    device: str | None = None,
+    device: Optional[str] = None,
 ) -> TorchTrainResult:
     torch.manual_seed(random_state)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    dev = torch.device(device) if device else _get_device()
+    model = model.to(dev)
+    model = _maybe_compile(model)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
-    train_loader, val_loader = _make_loaders(X_train, y_train, X_val, y_val, batch_size=batch_size)
+    scaler = GradScaler(enabled=_amp_enabled())
 
-    best_state = None
+    train_loader, val_loader = _make_loaders(X_train, y_train, X_val, y_val, batch_size, dev)
+
+    best_state: Optional[Dict[str, torch.Tensor]] = None
     best_val = float("inf")
     bad = 0
+
     for _ in range(epochs):
         model.train()
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
+            xb = xb.to(dev, non_blocking=True)
+            yb = yb.to(dev, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast_ctx():
+                loss = criterion(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
         model.eval()
-        losses = []
+        losses: list[float] = []
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                losses.append(float(criterion(model(xb), yb).item()))
+                xb = xb.to(dev, non_blocking=True)
+                yb = yb.to(dev, non_blocking=True)
+                with _autocast_ctx():
+                    losses.append(float(criterion(model(xb), yb).item()))
+
         val_loss = float(np.mean(losses)) if losses else float("inf")
         if val_loss < best_val - 1e-6:
             best_val = val_loss
@@ -223,10 +347,15 @@ def _train_torch_classifier(
             bad += 1
             if bad >= patience:
                 break
+
     if best_state is not None:
         model.load_state_dict(best_state)
     return TorchTrainResult(model=model, best_val_loss=best_val)
 
+
+# ---------------------------------------------------------------------------
+# Public training functions
+# ---------------------------------------------------------------------------
 
 def train_torch_mlp(
     X_train: np.ndarray,
@@ -235,7 +364,7 @@ def train_torch_mlp(
     y_val: np.ndarray,
     input_dim: int,
     n_classes: int,
-    hidden_sizes=(128, 64),
+    hidden_sizes: Sequence[int] = (128, 64),
     dropout: float = 0.2,
     batch_size: int = 256,
     epochs: int = 40,
@@ -243,9 +372,14 @@ def train_torch_mlp(
     weight_decay: float = 1e-4,
     patience: int = 8,
     random_state: int = 42,
-    device: str | None = None,
+    device: Optional[str] = None,
 ) -> TorchTrainResult:
-    model = TorchMLP(input_dim=input_dim, n_classes=n_classes, hidden_sizes=hidden_sizes, dropout=dropout)
+    model = TorchMLP(
+        input_dim=input_dim,
+        n_classes=n_classes,
+        hidden_sizes=hidden_sizes,
+        dropout=dropout,
+    )
     return _train_torch_classifier(
         model,
         X_train,
@@ -278,13 +412,30 @@ def train_gru_classifier(
     weight_decay: float = 1e-4,
     patience: int = 8,
     random_state: int = 42,
-    device: str | None = None,
+    device: Optional[str] = None,
     bidirectional: bool = False,
 ) -> TorchTrainResult:
-    model = TorchGRUClassifier(input_dim=input_dim, n_classes=n_classes, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, bidirectional=bidirectional)
+    model = TorchGRUClassifier(
+        input_dim=input_dim,
+        n_classes=n_classes,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        bidirectional=bidirectional,
+    )
     return _train_torch_classifier(
-        model, X_train, y_train, X_val, y_val, batch_size=batch_size, epochs=epochs,
-        learning_rate=learning_rate, weight_decay=weight_decay, patience=patience, random_state=random_state, device=device
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
+        random_state=random_state,
+        device=device,
     )
 
 
@@ -304,12 +455,28 @@ def train_bilstm_classifier(
     weight_decay: float = 1e-4,
     patience: int = 8,
     random_state: int = 42,
-    device: str | None = None,
+    device: Optional[str] = None,
 ) -> TorchTrainResult:
-    model = TorchBiLSTMClassifier(input_dim=input_dim, n_classes=n_classes, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+    model = TorchBiLSTMClassifier(
+        input_dim=input_dim,
+        n_classes=n_classes,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+    )
     return _train_torch_classifier(
-        model, X_train, y_train, X_val, y_val, batch_size=batch_size, epochs=epochs,
-        learning_rate=learning_rate, weight_decay=weight_decay, patience=patience, random_state=random_state, device=device
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
+        random_state=random_state,
+        device=device,
     )
 
 
@@ -329,29 +496,67 @@ def train_tcn_classifier(
     weight_decay: float = 1e-4,
     patience: int = 8,
     random_state: int = 42,
-    device: str | None = None,
+    device: Optional[str] = None,
 ) -> TorchTrainResult:
-    model = TorchTCNClassifier(input_dim=input_dim, n_classes=n_classes, channels=channels, kernel_size=kernel_size, dropout=dropout)
+    model = TorchTCNClassifier(
+        input_dim=input_dim,
+        n_classes=n_classes,
+        channels=channels,
+        kernel_size=kernel_size,
+        dropout=dropout,
+    )
     return _train_torch_classifier(
-        model, X_train, y_train, X_val, y_val, batch_size=batch_size, epochs=epochs,
-        learning_rate=learning_rate, weight_decay=weight_decay, patience=patience, random_state=random_state, device=device
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
+        random_state=random_state,
+        device=device,
     )
 
 
-def predict_torch(model: nn.Module, X: np.ndarray, device: str | None = None) -> np.ndarray:
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
-    with torch.no_grad():
-        xb = torch.tensor(X, dtype=torch.float32, device=device)
-        logits = model(xb)
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-    return preds
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
 
+def predict_torch(
+    model: nn.Module,
+    X: np.ndarray,
+    device: Optional[str] = None,
+    batch_size: int = 2048,
+) -> np.ndarray:
+    dev = torch.device(device) if device else _get_device()
+    model = model.to(dev)
+    model.eval()
+
+    Xt = torch.as_tensor(X, dtype=torch.float32)
+    preds_list: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for start in range(0, len(Xt), batch_size):
+            xb = Xt[start : start + batch_size].to(dev, non_blocking=True)
+            with _autocast_ctx():
+                logits = model(xb)
+            preds_list.append(torch.argmax(logits, dim=1).cpu())
+
+    return torch.cat(preds_list).numpy()
+
+
+# ---------------------------------------------------------------------------
+# Parameter counting
+# ---------------------------------------------------------------------------
 
 def model_parameter_count(model) -> int:
     if isinstance(model, nn.Module):
-        return sum(p.numel() for p in model.parameters())
+        # unwrap torch.compile wrapper if present
+        underlying = getattr(model, "_orig_mod", model)
+        return sum(p.numel() for p in underlying.parameters())
     if hasattr(model, "estimators_"):  # random forest
         return int(sum(getattr(est.tree_, "node_count", 0) for est in model.estimators_))
     if hasattr(model, "coefs_"):
