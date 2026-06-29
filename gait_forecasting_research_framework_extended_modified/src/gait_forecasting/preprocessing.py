@@ -1,23 +1,52 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 
 from .data import SubjectDataset, make_forecast_target
 
 
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _to_tensor(x: np.ndarray, device: torch.device) -> torch.Tensor:
+    return torch.as_tensor(x, dtype=torch.float32, device=device)
+
+
+def _to_numpy(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Signal conditioning
+# ---------------------------------------------------------------------------
+
 def smooth_signal(X: np.ndarray, window: int = 5) -> np.ndarray:
     if window <= 1:
         return X.astype(float, copy=True)
-    kernel = np.ones(window, dtype=float) / float(window)
-    out = np.empty_like(X, dtype=float)
-    for i in range(X.shape[1]):
-        out[:, i] = np.convolve(X[:, i], kernel, mode="same")
-    return out
+    device = _get_device()
+    Xt = _to_tensor(X, device)                        # (T, C)
+    # Conv1d expects (N, C_in, L); treat each channel independently
+    T, C = Xt.shape
+    Xt_t = Xt.T.unsqueeze(0)                          # (1, C, T)
+    kernel = torch.ones(1, 1, window, device=device, dtype=torch.float32) / window
+    pad = window // 2
+    # group conv: each channel convolved with the same box kernel
+    Xt_t = Xt_t.view(C, 1, T)
+    smoothed = F.conv1d(Xt_t, kernel, padding=pad)    # (C, 1, T)
+    # Trim or pad to original length to match numpy "same" semantics
+    smoothed = smoothed[:, 0, :T]                     # (C, T)
+    return _to_numpy(smoothed.T)                      # (T, C)
 
 
 def fit_scaler(X: np.ndarray) -> StandardScaler:
@@ -31,27 +60,42 @@ def transform_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
 
 
 def minmax_positive(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    X = np.nan_to_num(np.asarray(X, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-    X = X - X.min(axis=0, keepdims=True)
-    X = np.maximum(X, 0.0)
-    return X + eps
+    device = _get_device()
+    Xt = _to_tensor(
+        np.nan_to_num(np.asarray(X, dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
+        device,
+    )
+    Xt = Xt - Xt.min(dim=0, keepdim=True).values
+    Xt = torch.clamp(Xt, min=0.0)
+    return _to_numpy(Xt + eps)
 
 
 def condition_emg(
     X: np.ndarray,
     smooth: bool = False,
     smooth_window: int = 5,
-    scaler: StandardScaler | None = None,
+    scaler: Optional[StandardScaler] = None,
     rectify: bool = False,
 ) -> np.ndarray:
-    out = np.asarray(X, dtype=float)
+    device = _get_device()
+    out = _to_tensor(np.asarray(X, dtype=float), device)
+
     if smooth:
-        out = smooth_signal(out, window=smooth_window)
+        # Reuse smooth_signal but stay on GPU via the tensor path
+        T, C = out.shape
+        kernel = torch.ones(1, 1, smooth_window, device=device) / smooth_window
+        pad = smooth_window // 2
+        out_t = out.T.unsqueeze(0).view(C, 1, T)
+        out_t = F.conv1d(out_t, kernel, padding=pad)[:, 0, :T]
+        out = out_t.T
+
     if rectify:
-        out = np.abs(out)
+        out = torch.abs(out)
+
+    result = _to_numpy(out)
     if scaler is not None:
-        out = transform_scaler(out, scaler)
-    return out
+        result = transform_scaler(result, scaler)
+    return result
 
 
 def ms_to_samples(ms: int, sample_rate_hz: int) -> int:
@@ -60,9 +104,12 @@ def ms_to_samples(ms: int, sample_rate_hz: int) -> int:
 
 def overlap_to_stride(window_size: int, overlap: float) -> int:
     overlap = float(np.clip(overlap, 0.0, 0.99))
-    stride = int(round(window_size * (1.0 - overlap)))
-    return max(1, stride)
+    return max(1, int(round(window_size * (1.0 - overlap))))
 
+
+# ---------------------------------------------------------------------------
+# Windowed dataset
+# ---------------------------------------------------------------------------
 
 @dataclass
 class WindowedDataset:
@@ -88,51 +135,64 @@ def build_windows_from_subject(
     y = np.asarray(subject.y)
     if len(X) != len(y):
         raise ValueError(f"X/y length mismatch for {subject.subject_id}")
-    n = len(X)
+    n, n_feat = len(X), X.shape[1]
     if window_size <= 0:
         raise ValueError("window_size must be positive")
     if stride <= 0:
         raise ValueError("stride must be positive")
 
-    seqs, flats, targets = [], [], []
-    subject_ids, cycle_ids, gait_percent, starts, ends = [], [], [], [], []
+    device = _get_device()
+    Xt = _to_tensor(X, device)                        # (T, C) on GPU
 
-    for start in range(0, n - window_size + 1, stride):
-        end = start + window_size - 1
-        target_idx = start + window_size - 1 + horizon_steps
-        if use_center_label:
-            target_idx = start + window_size // 2 + horizon_steps
-        if target_idx >= n:
-            break
-        seq = X[start : start + window_size]
-        seqs.append(seq)
-        flats.append(seq.reshape(-1))
-        targets.append(y[target_idx])
-        subject_ids.append(subject.subject_id)
-        if subject.cycle_id is not None:
-            cycle_ids.append(subject.cycle_id[end])
-        if subject.gait_percent is not None:
-            gait_percent.append(float(subject.gait_percent[end]))
-        starts.append(start)
-        ends.append(end)
+    # Compute valid start indices on CPU (indexing logic is trivial)
+    starts_np = np.arange(0, n - window_size + 1, stride, dtype=np.int32)
+    if use_center_label:
+        target_indices = starts_np + window_size // 2 + horizon_steps
+    else:
+        target_indices = starts_np + window_size - 1 + horizon_steps
 
-    if not seqs:
+    valid_mask = target_indices < n
+    starts_np = starts_np[valid_mask]
+    target_indices = target_indices[valid_mask]
+
+    if len(starts_np) == 0:
         return WindowedDataset(
-            X_seq=np.empty((0, window_size, X.shape[1])),
-            X_flat=np.empty((0, window_size * X.shape[1])),
+            X_seq=np.empty((0, window_size, n_feat)),
+            X_flat=np.empty((0, window_size * n_feat)),
             y=np.empty((0,), dtype=y.dtype),
             subject_ids=np.empty((0,), dtype=object),
         )
 
+    # Build sequence tensor on GPU using advanced indexing
+    # idx: (N_windows, window_size)
+    idx = (
+        torch.as_tensor(starts_np, dtype=torch.long, device=device).unsqueeze(1)
+        + torch.arange(window_size, device=device).unsqueeze(0)
+    )
+    seqs_t = Xt[idx]                                  # (N, W, C)
+    seqs_np = _to_numpy(seqs_t)
+    flats_np = seqs_np.reshape(len(seqs_np), -1)
+
+    targets = y[target_indices]
+    ends_np = starts_np + window_size - 1
+
+    subject_ids_arr = np.full(len(starts_np), subject.subject_id, dtype=object)
+    cycle_ids_arr = (
+        subject.cycle_id[ends_np] if subject.cycle_id is not None else None
+    )
+    gait_arr = (
+        subject.gait_percent[ends_np].astype(float) if subject.gait_percent is not None else None
+    )
+
     return WindowedDataset(
-        X_seq=np.asarray(seqs, dtype=float),
-        X_flat=np.asarray(flats, dtype=float),
-        y=np.asarray(targets, dtype=int),
-        subject_ids=np.asarray(subject_ids, dtype=object),
-        cycle_ids=np.asarray(cycle_ids, dtype=object) if cycle_ids else None,
-        gait_percent=np.asarray(gait_percent, dtype=float) if gait_percent else None,
-        start_indices=np.asarray(starts, dtype=int),
-        end_indices=np.asarray(ends, dtype=int),
+        X_seq=seqs_np,
+        X_flat=flats_np,
+        y=targets.astype(int),
+        subject_ids=subject_ids_arr,
+        cycle_ids=np.asarray(cycle_ids_arr, dtype=object) if cycle_ids_arr is not None else None,
+        gait_percent=gait_arr,
+        start_indices=starts_np.astype(int),
+        end_indices=ends_np.astype(int),
         source_shapes=[X.shape],
     )
 
@@ -144,8 +204,15 @@ def build_windowed_dataset(
     overlap: float = 0.5,
     use_center_label: bool = False,
 ) -> WindowedDataset:
-    all_seq, all_flat, all_y, all_subject_ids = [], [], [], []
-    all_cycle, all_gait, all_start, all_end = [], [], [], []
+    all_seq: List[np.ndarray] = []
+    all_flat: List[np.ndarray] = []
+    all_y: List[np.ndarray] = []
+    all_subject_ids: List[np.ndarray] = []
+    all_cycle: List[np.ndarray] = []
+    all_gait: List[np.ndarray] = []
+    all_start: List[np.ndarray] = []
+    all_end: List[np.ndarray] = []
+
     stride = overlap_to_stride(window_size, overlap)
 
     for subject in subjects:
@@ -172,9 +239,10 @@ def build_windowed_dataset(
             all_end.append(wd.end_indices)
 
     if not all_seq:
+        n_feat = subjects[0].X.shape[1] if subjects else 0
         return WindowedDataset(
-            X_seq=np.empty((0, window_size, subjects[0].X.shape[1] if subjects else 0)),
-            X_flat=np.empty((0, window_size * (subjects[0].X.shape[1] if subjects else 0))),
+            X_seq=np.empty((0, window_size, n_feat)),
+            X_flat=np.empty((0, window_size * n_feat)),
             y=np.empty((0,), dtype=int),
             subject_ids=np.empty((0,), dtype=object),
         )
