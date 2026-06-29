@@ -1,156 +1,282 @@
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Optional, Sequence
 
 import numpy as np
+import torch
 
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _to_f64(x: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Cast to float64 on device; ridge regression benefits from full precision."""
+    return torch.as_tensor(x, dtype=torch.float64, device=device)
+
+
+def _to_numpy(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class LinearStateSpaceModel:
     A: np.ndarray
-    B: np.ndarray | None = None
-    bias: np.ndarray | None = None
+    B: Optional[np.ndarray] = None
+    bias: Optional[np.ndarray] = None
     ridge: float = 1e-6
 
-    def predict_next(self, x: np.ndarray, u: np.ndarray | None = None) -> np.ndarray:
-        x = np.asarray(x, dtype=float).reshape(-1)
-        y = self.A @ x
-        if self.B is not None and u is not None:
-            y = y + self.B @ np.asarray(u, dtype=float).reshape(-1)
-        if self.bias is not None:
-            y = y + self.bias
-        return y
+    # Cached GPU tensors — populated lazily
+    _A_t: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    _B_t: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    _bias_t: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    _device: Optional[torch.device] = field(default=None, repr=False, compare=False)
 
-    def forecast(self, x0: np.ndarray, u_seq: np.ndarray | None = None, steps: int = 1) -> np.ndarray:
-        x = np.asarray(x0, dtype=float).reshape(-1)
-        out = [x.copy()]
+    def _ensure_tensors(self, device: torch.device) -> None:
+        if self._device == device and self._A_t is not None:
+            return
+        self._A_t = torch.as_tensor(self.A, dtype=torch.float64, device=device)
+        self._B_t = (
+            torch.as_tensor(self.B, dtype=torch.float64, device=device)
+            if self.B is not None
+            else None
+        )
+        self._bias_t = (
+            torch.as_tensor(self.bias, dtype=torch.float64, device=device)
+            if self.bias is not None
+            else None
+        )
+        self._device = device
+
+    def predict_next(
+        self,
+        x: np.ndarray,
+        u: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        device = _get_device()
+        self._ensure_tensors(device)
+        xt = torch.as_tensor(x, dtype=torch.float64, device=device).reshape(-1)
+        y = self._A_t @ xt
+        if self._B_t is not None and u is not None:
+            y = y + self._B_t @ torch.as_tensor(u, dtype=torch.float64, device=device).reshape(-1)
+        if self._bias_t is not None:
+            y = y + self._bias_t
+        return _to_numpy(y)
+
+    def forecast(
+        self,
+        x0: np.ndarray,
+        u_seq: Optional[np.ndarray] = None,
+        steps: int = 1,
+    ) -> np.ndarray:
+        device = _get_device()
+        self._ensure_tensors(device)
+        x = torch.as_tensor(x0, dtype=torch.float64, device=device).reshape(-1)
+        out = [_to_numpy(x)]
+        U = (
+            torch.as_tensor(u_seq, dtype=torch.float64, device=device)
+            if u_seq is not None
+            else None
+        )
         for k in range(steps):
-            u = None if u_seq is None else np.asarray(u_seq[min(k, len(u_seq) - 1)], dtype=float).reshape(-1)
-            x = self.predict_next(x, u)
-            out.append(x.copy())
+            y = self._A_t @ x
+            if self._B_t is not None and U is not None:
+                ui = U[min(k, len(U) - 1)]
+                y = y + self._B_t @ ui
+            if self._bias_t is not None:
+                y = y + self._bias_t
+            x = y
+            out.append(_to_numpy(x))
         return np.asarray(out)
+
+
+# ---------------------------------------------------------------------------
+# Fitting helpers
+# ---------------------------------------------------------------------------
+
+def _ridge_solve(Z: torch.Tensor, Y: torch.Tensor, ridge: float) -> torch.Tensor:
+    """Theta = (Z^T Z + ridge * I)^{-1} Z^T Y  — on GPU with float64."""
+    reg = ridge * torch.eye(Z.shape[1], dtype=torch.float64, device=Z.device)
+    return torch.linalg.solve(Z.T @ Z + reg, Z.T @ Y)
+
+
+def _build_theta(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    U: Optional[torch.Tensor],
+    include_bias: bool,
+    ridge: float,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Returns (A, B, bias) as numpy arrays via a single GPU solve."""
+    Z = X
+    if U is not None:
+        Z = torch.cat([Z, U], dim=1)
+    if include_bias:
+        Z = torch.cat([Z, torch.ones(len(Z), 1, dtype=torch.float64, device=Z.device)], dim=1)
+
+    Theta = _ridge_solve(Z, Y, ridge)          # (features, n_state)
+
+    n_state = X.shape[1]
+    A = Theta[:n_state].T
+
+    B: Optional[torch.Tensor] = None
+    if U is not None:
+        n_input = U.shape[1]
+        B = Theta[n_state : n_state + n_input].T
+
+    bias: Optional[torch.Tensor] = None
+    if include_bias:
+        bias = Theta[-1]
+
+    return A, B, bias
 
 
 def fit_linear_state_space(
     states: np.ndarray,
-    inputs: np.ndarray | None = None,
+    inputs: Optional[np.ndarray] = None,
     ridge: float = 1e-6,
     include_bias: bool = True,
 ) -> LinearStateSpaceModel:
-    """
-    Fit x(k+1) = A x(k) + B u(k) (+ b) using ridge-regularized least squares.
-    states: (T, n_state)
-    inputs: (T, n_input) or None
-    """
     states = np.asarray(states, dtype=float)
     if states.ndim != 2 or len(states) < 2:
         raise ValueError("states must be 2D with at least 2 timesteps")
 
-    X = states[:-1]
-    Y = states[1:]
+    device = _get_device()
+    St = _to_f64(states, device)
+    Xt, Yt = St[:-1], St[1:]
+
+    Ut: Optional[torch.Tensor] = None
     if inputs is not None:
-        U = np.asarray(inputs, dtype=float)
-        if len(U) != len(states):
+        inp = np.asarray(inputs, dtype=float)
+        if len(inp) != len(states):
             raise ValueError("inputs must match states length")
-        U = U[:-1]
-        Z = np.hstack([X, U])
-    else:
-        U = None
-        Z = X
+        Ut = _to_f64(inp, device)[:-1]
 
-    if include_bias:
-        Z = np.hstack([Z, np.ones((len(Z), 1), dtype=float)])
+    A_t, B_t, bias_t = _build_theta(Xt, Yt, Ut, include_bias, ridge)
 
-    reg = ridge * np.eye(Z.shape[1], dtype=float)
-    Theta = np.linalg.solve(Z.T @ Z + reg, Z.T @ Y)  # (features, state)
-
-    if inputs is not None:
-        n_state = X.shape[1]
-        n_input = U.shape[1]
-        A = Theta[:n_state].T
-        B = Theta[n_state:n_state + n_input].T
-        bias = Theta[-1].T if include_bias else None
-        return LinearStateSpaceModel(A=A, B=B, bias=bias, ridge=ridge)
-    else:
-        A = Theta[:X.shape[1]].T
-        bias = Theta[-1].T if include_bias else None
-        return LinearStateSpaceModel(A=A, B=None, bias=bias, ridge=ridge)
+    return LinearStateSpaceModel(
+        A=_to_numpy(A_t),
+        B=_to_numpy(B_t) if B_t is not None else None,
+        bias=_to_numpy(bias_t) if bias_t is not None else None,
+        ridge=ridge,
+    )
 
 
 def fit_linear_state_space_from_sequences(
     states_list: Sequence[np.ndarray],
-    inputs_list: Sequence[np.ndarray] | None = None,
+    inputs_list: Optional[Sequence[np.ndarray]] = None,
     ridge: float = 1e-6,
     include_bias: bool = True,
 ) -> LinearStateSpaceModel:
-    Xs, Ys, Us = [], [], []
     if inputs_list is not None and len(inputs_list) != len(states_list):
         raise ValueError("inputs_list must match states_list length")
+
+    device = _get_device()
+    Xs_list: list[torch.Tensor] = []
+    Ys_list: list[torch.Tensor] = []
+    Us_list: list[torch.Tensor] = []
+
     for i, states in enumerate(states_list):
-        states = np.asarray(states, dtype=float)
-        if len(states) < 2:
+        s = np.asarray(states, dtype=float)
+        if len(s) < 2:
             continue
-        Xs.append(states[:-1])
-        Ys.append(states[1:])
+        St = _to_f64(s, device)
+        Xs_list.append(St[:-1])
+        Ys_list.append(St[1:])
         if inputs_list is not None:
             u = np.asarray(inputs_list[i], dtype=float)
-            if len(u) != len(states):
+            if len(u) != len(s):
                 raise ValueError("inputs and states must have same length per sequence")
-            Us.append(u[:-1])
-    if not Xs:
-        raise ValueError("Need at least one sequence with length > 1")
-    X = np.vstack(Xs)
-    Y = np.vstack(Ys)
-    if inputs_list is not None:
-        U = np.vstack(Us)
-        Z = np.hstack([X, U])
-    else:
-        Z = X
-    if include_bias:
-        Z = np.hstack([Z, np.ones((len(Z), 1), dtype=float)])
-    reg = ridge * np.eye(Z.shape[1], dtype=float)
-    Theta = np.linalg.solve(Z.T @ Z + reg, Z.T @ Y)
-    if inputs_list is not None:
-        n_state = X.shape[1]
-        n_input = U.shape[1]
-        A = Theta[:n_state].T
-        B = Theta[n_state:n_state + n_input].T
-        bias = Theta[-1].T if include_bias else None
-        return LinearStateSpaceModel(A=A, B=B, bias=bias, ridge=ridge)
-    A = Theta[:X.shape[1]].T
-    bias = Theta[-1].T if include_bias else None
-    return LinearStateSpaceModel(A=A, B=None, bias=bias, ridge=ridge)
+            Us_list.append(_to_f64(u, device)[:-1])
 
+    if not Xs_list:
+        raise ValueError("Need at least one sequence with length > 1")
+
+    X = torch.cat(Xs_list, dim=0)
+    Y = torch.cat(Ys_list, dim=0)
+    U = torch.cat(Us_list, dim=0) if Us_list else None
+
+    A_t, B_t, bias_t = _build_theta(X, Y, U, include_bias, ridge)
+
+    return LinearStateSpaceModel(
+        A=_to_numpy(A_t),
+        B=_to_numpy(B_t) if B_t is not None else None,
+        bias=_to_numpy(bias_t) if bias_t is not None else None,
+        ridge=ridge,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forecasting
+# ---------------------------------------------------------------------------
 
 def forecast_horizon_sequence(
     model: LinearStateSpaceModel,
     states: np.ndarray,
-    inputs: np.ndarray | None,
+    inputs: Optional[np.ndarray],
     horizon_steps: int,
 ) -> np.ndarray:
     states = np.asarray(states, dtype=float)
-    T = len(states)
-    out = np.full_like(states, np.nan, dtype=float)
-    for t in range(T):
-        if t + horizon_steps >= T:
-            break
-        x = states[t]
-        for h in range(horizon_steps):
-            u = None
-            if inputs is not None:
-                idx = min(t + h, len(inputs) - 1)
-                u = inputs[idx]
-            x = model.predict_next(x, u)
-        out[t] = x
-    return out
+    T, n_state = states.shape
+    device = _get_device()
+    model._ensure_tensors(device)
+
+    if horizon_steps == 0:
+        return states.copy()
+
+    St = torch.as_tensor(states, dtype=torch.float64, device=device)
+    Ut = (
+        torch.as_tensor(inputs, dtype=torch.float64, device=device)
+        if inputs is not None
+        else None
+    )
+
+    out = torch.full((T, n_state), float("nan"), dtype=torch.float64, device=device)
+
+    # Vectorise over the horizon loop; for each valid t, roll out h steps.
+    # For typical horizon_steps (1–20) a Python loop over h is fine; the
+    # heavy work (matrix-vector products) runs on GPU.
+    A = model._A_t           # (n_state, n_state)
+    B = model._B_t           # (n_state, n_input) or None
+    bias = model._bias_t     # (n_state,) or None
+
+    valid_T = T - horizon_steps
+    if valid_T <= 0:
+        return _to_numpy(out)
+
+    # x: (valid_T, n_state) — batch of initial states
+    x = St[:valid_T]
+
+    for h in range(horizon_steps):
+        # y = x @ A^T  (batched matmul)
+        y = x @ A.T
+        if B is not None and Ut is not None:
+            u_idx = torch.clamp(
+                torch.arange(h, valid_T + h, device=device),
+                max=T - 1,
+            )
+            y = y + Ut[u_idx] @ B.T
+        if bias is not None:
+            y = y + bias
+        x = y
+
+    out[:valid_T] = x
+    return _to_numpy(out)
 
 
 def forecast_latent_states(
     model: LinearStateSpaceModel,
     x0: np.ndarray,
-    u_seq: np.ndarray | None,
+    u_seq: Optional[np.ndarray],
     steps: int,
 ) -> np.ndarray:
     return model.forecast(x0=x0, u_seq=u_seq, steps=steps)
