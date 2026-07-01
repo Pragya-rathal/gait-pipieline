@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -813,3 +812,272 @@ def generate_research_artifacts(
 
     save_json(output_dir / "research_artifacts.json", {"keys": sorted(list(artifacts.keys()))})
     return artifacts
+
+
+# ===========================================================================
+# Experiment orchestration — all computation flows through pipeline.run_pipeline
+# ===========================================================================
+
+def run_window_sweep(
+    base_cfg: PipelineConfig,
+    window_ms_values: Sequence[int],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Sweep over window sizes; all execution via pipeline.run_pipeline."""
+    from . import pipeline as _pipeline
+    from .evaluate import generate_reports
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for win in window_ms_values:
+        from .config import WindowConfig
+        cfg = PipelineConfig(
+            data_dir=base_cfg.data_dir,
+            output_dir=output_dir / f"window_{win}ms",
+            normalize=base_cfg.normalize,
+            smooth=base_cfg.smooth,
+            use_synergies=base_cfg.use_synergies,
+            use_dh=base_cfg.use_dh,
+            use_d2h=base_cfg.use_d2h,
+            demo=base_cfg.demo,
+            random_state=base_cfg.random_state,
+            synergy=base_cfg.synergy,
+            model=base_cfg.model,
+            eval=base_cfg.eval,
+            windows=WindowConfig(
+                window_ms=(win,),
+                forecast_ms=base_cfg.windows.forecast_ms,
+                overlap=base_cfg.windows.overlap,
+                sample_rate_hz=base_cfg.windows.sample_rate_hz,
+                use_center_label=base_cfg.windows.use_center_label,
+            ),
+        )
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"window_ms": win, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "window_sweep_results.csv", index=False)
+    export_table_bundle(df, output_dir / "window_sweep_results")
+    return df
+
+
+def run_horizon_sweep(
+    base_cfg: PipelineConfig,
+    horizon_ms_values: Sequence[int],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Sweep over forecast horizons; all execution via pipeline.run_pipeline."""
+    from . import pipeline as _pipeline
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for hz in horizon_ms_values:
+        from .config import WindowConfig
+        cfg = PipelineConfig(
+            data_dir=base_cfg.data_dir,
+            output_dir=output_dir / f"horizon_{hz}ms",
+            normalize=base_cfg.normalize,
+            smooth=base_cfg.smooth,
+            use_synergies=base_cfg.use_synergies,
+            use_dh=base_cfg.use_dh,
+            use_d2h=base_cfg.use_d2h,
+            demo=base_cfg.demo,
+            random_state=base_cfg.random_state,
+            synergy=base_cfg.synergy,
+            model=base_cfg.model,
+            eval=base_cfg.eval,
+            windows=WindowConfig(
+                window_ms=base_cfg.windows.window_ms,
+                forecast_ms=(hz,),
+                overlap=base_cfg.windows.overlap,
+                sample_rate_hz=base_cfg.windows.sample_rate_hz,
+                use_center_label=base_cfg.windows.use_center_label,
+            ),
+        )
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"horizon_ms": hz, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "horizon_sweep_results.csv", index=False)
+    export_table_bundle(df, output_dir / "horizon_sweep_results")
+    return df
+
+
+def run_synergy_sweep(
+    base_cfg: PipelineConfig,
+    n_synergies_values: Sequence[int],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Sweep over number of NMF synergies; all execution via pipeline.run_pipeline."""
+    from . import pipeline as _pipeline
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for n_syn in n_synergies_values:
+        from .config import SynergyConfig
+        cfg = PipelineConfig(
+            data_dir=base_cfg.data_dir,
+            output_dir=output_dir / f"n_synergies_{n_syn}",
+            normalize=base_cfg.normalize,
+            smooth=base_cfg.smooth,
+            use_synergies=base_cfg.use_synergies,
+            use_dh=base_cfg.use_dh,
+            use_d2h=base_cfg.use_d2h,
+            demo=base_cfg.demo,
+            random_state=base_cfg.random_state,
+            synergy=SynergyConfig(
+                n_synergies=n_syn,
+                max_iter=base_cfg.synergy.max_iter,
+                random_state=base_cfg.synergy.random_state,
+                threshold=base_cfg.synergy.threshold,
+            ),
+            model=base_cfg.model,
+            eval=base_cfg.eval,
+            windows=base_cfg.windows,
+        )
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"n_synergies": n_syn, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "synergy_sweep_results.csv", index=False)
+    export_table_bundle(df, output_dir / "synergy_sweep_results")
+    return df
+
+
+def run_seed_experiments(
+    base_cfg: PipelineConfig,
+    seeds: Sequence[int],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Repeat pipeline across random seeds to measure variance."""
+    from . import pipeline as _pipeline
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for seed in seeds:
+        cfg = PipelineConfig(
+            data_dir=base_cfg.data_dir,
+            output_dir=output_dir / f"seed_{seed}",
+            normalize=base_cfg.normalize,
+            smooth=base_cfg.smooth,
+            use_synergies=base_cfg.use_synergies,
+            use_dh=base_cfg.use_dh,
+            use_d2h=base_cfg.use_d2h,
+            demo=base_cfg.demo,
+            random_state=seed,
+            synergy=base_cfg.synergy,
+            model=base_cfg.model,
+            eval=base_cfg.eval,
+            windows=base_cfg.windows,
+        )
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"seed": seed, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "seed_experiment_results.csv", index=False)
+    export_table_bundle(df, output_dir / "seed_experiment_results")
+    return df
+
+
+def run_ablation_study(
+    base_cfg: PipelineConfig,
+    ablations: Mapping[str, Dict[str, Any]],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """
+    Run ablation variants. Each key in ``ablations`` is a variant name;
+    value is a dict of PipelineConfig field overrides.
+    All execution flows through pipeline.run_pipeline.
+    """
+    from . import pipeline as _pipeline
+    from dataclasses import replace
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for variant_name, overrides in ablations.items():
+        variant_dir = ensure_dir(output_dir / variant_name)
+        field_overrides = {"data_dir": base_cfg.data_dir, "output_dir": variant_dir, **overrides}
+        cfg = PipelineConfig(**{
+            f.name: field_overrides.get(f.name, getattr(base_cfg, f.name))
+            for f in base_cfg.__dataclass_fields__.values()
+        })
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"variant": variant_name, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "ablation_results.csv", index=False)
+    export_table_bundle(df, output_dir / "ablation_results")
+    return df
+
+
+def run_experiment_sweep(
+    base_cfg: PipelineConfig,
+    output_dir: Path,
+    window_ms_values: Sequence[int] | None = None,
+    horizon_ms_values: Sequence[int] | None = None,
+    n_synergies_values: Sequence[int] | None = None,
+    seeds: Sequence[int] | None = None,
+    run_benchmark: bool = True,
+    benchmark_kwargs: Dict[str, Any] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    """Run all configured sweeps and return a dict of result DataFrames."""
+    from . import pipeline as _pipeline
+    output_dir = ensure_dir(Path(output_dir))
+    results: Dict[str, pd.DataFrame] = {}
+
+    if window_ms_values:
+        results["window_sweep"] = run_window_sweep(base_cfg, window_ms_values, output_dir / "window_sweep")
+    if horizon_ms_values:
+        results["horizon_sweep"] = run_horizon_sweep(base_cfg, horizon_ms_values, output_dir / "horizon_sweep")
+    if n_synergies_values:
+        results["synergy_sweep"] = run_synergy_sweep(base_cfg, n_synergies_values, output_dir / "synergy_sweep")
+    if seeds:
+        results["seed_experiments"] = run_seed_experiments(base_cfg, seeds, output_dir / "seed_experiments")
+
+    if run_benchmark:
+        _pipeline.run_benchmark(base_cfg, **(benchmark_kwargs or {}))
+
+    save_json(output_dir / "sweep_manifest.json", {"sweep_keys": list(results.keys())})
+    return results
+
+
+def run_model_comparison(
+    base_cfg: PipelineConfig,
+    model_configs: Mapping[str, Any],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """
+    Compare different model configurations by running pipeline for each.
+    model_configs maps name -> dict of ModelConfig field overrides.
+    """
+    from . import pipeline as _pipeline
+    from .config import ModelConfig
+    output_dir = ensure_dir(Path(output_dir))
+    rows = []
+    for model_name, model_overrides in model_configs.items():
+        base_fields = {f: getattr(base_cfg.model, f) for f in base_cfg.model.__dataclass_fields__}
+        base_fields.update(model_overrides)
+        new_model_cfg = ModelConfig(**base_fields)
+        cfg = PipelineConfig(
+            data_dir=base_cfg.data_dir,
+            output_dir=output_dir / model_name,
+            normalize=base_cfg.normalize,
+            smooth=base_cfg.smooth,
+            use_synergies=base_cfg.use_synergies,
+            use_dh=base_cfg.use_dh,
+            use_d2h=base_cfg.use_d2h,
+            demo=base_cfg.demo,
+            random_state=base_cfg.random_state,
+            synergy=base_cfg.synergy,
+            model=new_model_cfg,
+            eval=base_cfg.eval,
+            windows=base_cfg.windows,
+        )
+        summary = _pipeline.run_pipeline(cfg)
+        for fold_key, fold_data in summary.get("folds", {}).items():
+            agg = fold_data.get("aggregate", {})
+            rows.append({"model": model_name, "fold_key": fold_key, **{k: v for k, v in agg.items() if isinstance(v, (int, float))}})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "model_comparison_results.csv", index=False)
+    export_table_bundle(df, output_dir / "model_comparison_results")
+    return df
