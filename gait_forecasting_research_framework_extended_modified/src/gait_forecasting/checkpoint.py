@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -84,6 +85,18 @@ def _safe_write_json(path: Path, obj: Any) -> None:
     tmp.replace(path)
 
 
+def _safe_dump_joblib(path: Path, obj: Any) -> None:
+    tmp = path.with_suffix(".tmp")
+    joblib.dump(obj, tmp)
+    tmp.replace(path)
+
+
+def _device_remap(device: Optional[torch.device]) -> str:
+    if device is None:
+        return "cpu"
+    return str(device)
+
+
 # ---------------------------------------------------------------------------
 # Main checkpoint manager
 # ---------------------------------------------------------------------------
@@ -91,18 +104,26 @@ def _safe_write_json(path: Path, obj: Any) -> None:
 class CheckpointManager:
     """
     Production-grade checkpoint manager that is completely independent of
-    model architecture.  Works with any ``nn.Module``.
+    model architecture. Works with any ``nn.Module``.
 
     Automatically saves:
-    - ``best_model.pt``     — checkpoint at best validation metric
-    - ``last_model.pt``     — checkpoint at most recent epoch
-    - ``history.json``      — per-epoch metric log
-    - ``metrics.json``      — best and final summary metrics
-    - ``config.json``       — configuration dictionary
-    - ``metadata.json``     — model / framework metadata for deployment
+    - ``best_model.pt``          — checkpoint at best validation metric
+    - ``last_model.pt``          — checkpoint at most recent epoch
+    - ``history.json``           — per-epoch metric log
+    - ``metrics.json``           — best and final summary metrics
+    - ``config.json``            — configuration dictionary
+    - ``metadata.json``          — model / framework metadata for deployment
+    - ``pipeline_state.joblib``  — full non-architecture pipeline state
+                                    (NMF, normalization, PhysiologicalFusion,
+                                    latent encoder, label mappings, window
+                                    quality-check configuration)
 
     Optionally exports:
-    - ``best_model.onnx``   — ONNX export of the best checkpoint
+    - ``best_model.onnx``        — ONNX export of the best checkpoint
+
+    Every ``.pt``/``.json``/``.joblib`` write goes through a temp-file +
+    atomic ``rename`` so a checkpoint directory is never left in a
+    partially-written state if the process is interrupted mid-save.
 
     Parameters
     ----------
@@ -134,6 +155,9 @@ class CheckpointManager:
     CONFIG_JSON = "config.json"
     METADATA_JSON = "metadata.json"
     BEST_ONNX = "best_model.onnx"
+    PIPELINE_STATE_JOBLIB = "pipeline_state.joblib"
+    VERSION_FILE = "checkpoint_version.json"
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -167,6 +191,11 @@ class CheckpointManager:
         self.should_stop: bool = False
 
         _safe_write_json(self.checkpoint_dir / self.CONFIG_JSON, self.config)
+        _safe_write_json(self.checkpoint_dir / self.VERSION_FILE, {
+            "schema_version": self.SCHEMA_VERSION,
+            "framework_version": f"torch=={_torch_version()}",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
 
     # ------------------------------------------------------------------
     # Comparison
@@ -188,15 +217,18 @@ class CheckpointManager:
         scheduler: Optional[Any],
         epoch: int,
         metrics: Dict[str, float],
+        scaler: Optional[Any] = None,
     ) -> Dict[str, Any]:
         underlying = getattr(model, "_orig_mod", model)
         return {
+            "schema_version": self.SCHEMA_VERSION,
             "epoch": epoch,
             "best_val_metric": float(self._best_metric),
             "metric_name": self.metric_name,
             "model_state_dict": {k: v.cpu() for k, v in underlying.state_dict().items()},
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "grad_scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "config": self.config,
             "random_seed": self.random_seed,
             "rng_state": _rng_state(),
@@ -221,6 +253,7 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         metrics: Dict[str, float],
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
     ) -> bool:
         """
         Call once per epoch after validation.
@@ -232,6 +265,7 @@ class CheckpointManager:
         metrics : dict
             Must contain ``self.metric_name``.
         scheduler : optional LR scheduler
+        scaler : optional ``torch.cuda.amp.GradScaler``
 
         Returns
         -------
@@ -245,7 +279,7 @@ class CheckpointManager:
         record = {"epoch": epoch, **{k: float(v) for k, v in metrics.items()}}
         self._history.append(record)
 
-        payload = self._pack(model, optimizer, scheduler, epoch, metrics)
+        payload = self._pack(model, optimizer, scheduler, epoch, metrics, scaler=scaler)
         self._save(payload, self.LAST_PT)
 
         improved = self._is_better(metric_value)
@@ -275,6 +309,18 @@ class CheckpointManager:
 
         return improved
 
+    def save_last(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> Path:
+        """Persist a snapshot of the current model/optimizer without advancing the epoch counter."""
+        payload = self._pack(model, optimizer, scheduler, self._epoch, metrics or {}, scaler=scaler)
+        return self._save(payload, self.LAST_PT)
+
     # ------------------------------------------------------------------
     # Resume
     # ------------------------------------------------------------------
@@ -284,22 +330,31 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         from_best: bool = False,
         restore_rng: bool = False,
+        device: Optional[torch.device] = None,
+        strict: bool = True,
     ) -> int:
         """
         Load a saved checkpoint into ``model``, ``optimizer``, and optionally
-        ``scheduler``.
+        ``scheduler``/``scaler``.
 
         Parameters
         ----------
         model : nn.Module
         optimizer : torch.optim.Optimizer
         scheduler : optional
+        scaler : optional ``torch.cuda.amp.GradScaler``
         from_best : bool
             Load ``best_model.pt`` instead of ``last_model.pt``.
         restore_rng : bool
             Restore the full RNG state saved in the checkpoint.
+        device : torch.device, optional
+            Remap tensors onto this device (defaults to CPU for safety,
+            caller moves the model afterward).
+        strict : bool
+            Passed through to ``load_state_dict`` for the model.
 
         Returns
         -------
@@ -311,14 +366,18 @@ class CheckpointManager:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        map_location = _device_remap(device)
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
 
         underlying = getattr(model, "_orig_mod", model)
-        underlying.load_state_dict(ckpt["model_state_dict"])
+        underlying.load_state_dict(ckpt["model_state_dict"], strict=strict)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
         if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        if scaler is not None and ckpt.get("grad_scaler_state_dict") is not None:
+            scaler.load_state_dict(ckpt["grad_scaler_state_dict"])
 
         self._epoch = ckpt["epoch"]
         self._best_metric = ckpt.get("best_val_metric", self._best_metric)
@@ -329,8 +388,50 @@ class CheckpointManager:
 
         return self._epoch
 
+    def resume_training(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        from_best: bool = False,
+        restore_rng: bool = True,
+        device: Optional[torch.device] = None,
+        strict: bool = True,
+    ) -> int:
+        """Alias of :meth:`resume` with RNG restoration on by default, for mid-training resumption."""
+        return self.resume(
+            model, optimizer, scheduler=scheduler, scaler=scaler,
+            from_best=from_best, restore_rng=restore_rng, device=device, strict=strict,
+        )
+
+    def load_for_inference(
+        self,
+        model: nn.Module,
+        from_best: bool = True,
+        device: Optional[torch.device] = None,
+        strict: bool = True,
+    ) -> nn.Module:
+        """
+        Loads only model weights (no optimizer/scheduler/RNG state) for
+        deployment / evaluation use, and moves the model to ``device``.
+        """
+        filename = self.BEST_PT if from_best else self.LAST_PT
+        path = self.checkpoint_dir / filename
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+        map_location = _device_remap(device)
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        underlying = getattr(model, "_orig_mod", model)
+        underlying.load_state_dict(ckpt["model_state_dict"], strict=strict)
+        if device is not None:
+            underlying.to(device)
+        underlying.eval()
+        return model
+
     # ------------------------------------------------------------------
-    # Best checkpoint selection
+    # Best / latest checkpoint selection
     # ------------------------------------------------------------------
 
     def best_checkpoint_path(self) -> Path:
@@ -339,11 +440,25 @@ class CheckpointManager:
             raise FileNotFoundError(f"Best checkpoint not found: {path}")
         return path
 
-    def load_best(self, model: nn.Module) -> None:
+    def latest_checkpoint(self) -> Path:
+        """Returns the path to the most recently written checkpoint (last or best, whichever exists)."""
+        last_path = self.checkpoint_dir / self.LAST_PT
+        if last_path.exists():
+            return last_path
+        return self.best_checkpoint_path()
+
+    def best_checkpoint(self) -> Path:
+        """Alias of :meth:`best_checkpoint_path`."""
+        return self.best_checkpoint_path()
+
+    def load_best(self, model: nn.Module, device: Optional[torch.device] = None, strict: bool = True) -> None:
         """Load only model weights from the best checkpoint (inference use)."""
-        ckpt = torch.load(self.best_checkpoint_path(), map_location="cpu", weights_only=False)
+        map_location = _device_remap(device)
+        ckpt = torch.load(self.best_checkpoint_path(), map_location=map_location, weights_only=False)
         underlying = getattr(model, "_orig_mod", model)
-        underlying.load_state_dict(ckpt["model_state_dict"])
+        underlying.load_state_dict(ckpt["model_state_dict"], strict=strict)
+        if device is not None:
+            underlying.to(device)
 
     # ------------------------------------------------------------------
     # ONNX export
@@ -449,6 +564,45 @@ class CheckpointManager:
         return path
 
     # ------------------------------------------------------------------
+    # Full pipeline state (non-architecture stages)
+    # ------------------------------------------------------------------
+
+    def save_pipeline_state(self, state: Dict[str, Any]) -> Path:
+        """
+        Persists the complete non-architecture pipeline state — NMF
+        extractor/components, the raw normalization scaler, the
+        PhysiologicalFusion module's state_dict and constructor
+        dimensions, the latent encoder (PCA or autoencoder) parameters,
+        window quality-check configuration, and label mappings — so that
+        ``pipeline.py`` can fully reconstruct an identical feature graph
+        at inference time from this checkpoint directory alone.
+
+        ``state`` is an opaque, caller-defined dict; this method only
+        adds versioning metadata and writes it atomically. The shape of
+        ``state`` is owned by ``pipeline.py``'s ``save_pipeline_state`` /
+        ``load_pipeline_state`` helpers, not by this class.
+        """
+        payload = {
+            "schema_version": self.SCHEMA_VERSION,
+            "framework_version": f"torch=={_torch_version()}",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **state,
+        }
+        path = self.checkpoint_dir / self.PIPELINE_STATE_JOBLIB
+        _safe_dump_joblib(path, payload)
+        return path
+
+    def load_pipeline_state(self) -> Dict[str, Any]:
+        """Loads the bundle written by :meth:`save_pipeline_state`."""
+        path = self.checkpoint_dir / self.PIPELINE_STATE_JOBLIB
+        if not path.exists():
+            raise FileNotFoundError(f"No pipeline state found at {path}")
+        return joblib.load(path)
+
+    def has_pipeline_state(self) -> bool:
+        return (self.checkpoint_dir / self.PIPELINE_STATE_JOBLIB).exists()
+
+    # ------------------------------------------------------------------
     # Versioning helpers
     # ------------------------------------------------------------------
 
@@ -464,6 +618,25 @@ class CheckpointManager:
         checkpoints = self.list_versioned_checkpoints()
         for path in checkpoints[: max(0, len(checkpoints) - keep)]:
             path.unlink(missing_ok=True)
+
+    def schema_version(self) -> int:
+        """Reads the schema version recorded in checkpoint_version.json (defaults to 1 for legacy checkpoints)."""
+        path = self.checkpoint_dir / self.VERSION_FILE
+        if not path.exists():
+            return 1
+        try:
+            return int(json.loads(path.read_text()).get("schema_version", 1))
+        except Exception:
+            return 1
+
+    def copy_to(self, destination: Path) -> Path:
+        """Copies the entire checkpoint directory (architecture + pipeline state) to a new location, for versioned releases."""
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in self.checkpoint_dir.iterdir():
+            if item.is_file():
+                shutil.copy2(item, destination / item.name)
+        return destination
 
     # ------------------------------------------------------------------
     # Private
