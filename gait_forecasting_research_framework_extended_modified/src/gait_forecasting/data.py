@@ -1,13 +1,15 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import json
 import re
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupKFold, KFold, train_test_split
 
 
@@ -29,6 +31,8 @@ KNOWN_META_NAMES = {
     "phase2_name", "phase4_name", "phase7_name", "c3d_file",
 }
 KNOWN_PATH_NAMES = {"file", "filepath", "path", "source", "csv_path", "emg_path", "data_path"}
+
+EMG_WINDOW_SHAPE = (11, 400)
 
 
 @dataclass
@@ -57,7 +61,6 @@ def _unique_nonnull_count(s: pd.Series) -> int:
 
 
 def _is_identifier_like(series: pd.Series) -> bool:
-    # numeric identifiers with many unique values but not likely EMG
     if series.dtype == object:
         return True
     if _is_numeric_series(series) and _unique_nonnull_count(series) > max(20, int(0.5 * len(series))):
@@ -99,7 +102,6 @@ def _candidate_label_columns(df: pd.DataFrame) -> List[str]:
         nc = _normalize_name(c)
         if nc in KNOWN_LABEL_NAMES or nc.startswith("phase_") or nc.endswith("_label") or nc.endswith("_labels"):
             cols.append(c)
-    # favor low-cardinality non-EMG numeric or categorical columns
     for c in df.columns:
         if c in cols:
             continue
@@ -111,7 +113,6 @@ def _candidate_label_columns(df: pd.DataFrame) -> List[str]:
             cols.append(c)
         elif s.dtype == object and 2 <= _unique_nonnull_count(s) <= max(20, int(0.25 * len(df))):
             cols.append(c)
-    # de-duplicate preserve order
     out = []
     seen = set()
     for c in cols:
@@ -119,7 +120,6 @@ def _candidate_label_columns(df: pd.DataFrame) -> List[str]:
             out.append(c)
             seen.add(c)
     return out
-
 
 
 def _candidate_emg_columns(df: pd.DataFrame, label_cols: Sequence[str], meta_cols: Sequence[str]) -> List[str]:
@@ -132,7 +132,6 @@ def _candidate_emg_columns(df: pd.DataFrame, label_cols: Sequence[str], meta_col
             return False
         return _is_numeric_series(df[c])
 
-    # Prefer standardized EMG channels for this dataset.
     for suffixes in (("_normalized",), ("_raw", "_bandpassed", "_rectified", "_envelope")):
         emg = [
             c for c in df.columns
@@ -141,7 +140,6 @@ def _candidate_emg_columns(df: pd.DataFrame, label_cols: Sequence[str], meta_col
         if emg:
             return emg
 
-    # Fallback: any numeric feature that is not a known label/meta field.
     emg = []
     for c in df.columns:
         if not _eligible(c):
@@ -153,6 +151,16 @@ def _candidate_emg_columns(df: pd.DataFrame, label_cols: Sequence[str], meta_col
 
 def _coerce_str_series(s: pd.Series) -> np.ndarray:
     return s.astype(str).to_numpy()
+
+
+def _ensure_int_labels(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y)
+    if y.dtype.kind in {"U", "S", "O"}:
+        _, inv = np.unique(y.astype(str), return_inverse=True)
+        return inv.astype(int)
+    if y.dtype.kind == "f":
+        return np.rint(y).astype(int)
+    return y.astype(int)
 
 
 def _load_npz(path: Path) -> List[SubjectDataset]:
@@ -171,30 +179,19 @@ def _load_npz(path: Path) -> List[SubjectDataset]:
     return [SubjectDataset(subject_id=subject_id, X=X, y=_ensure_int_labels(y), channel_names=channel_names, cycle_id=cycle_id, gait_percent=gait_percent, sample_index=sample_index, source_file=str(path))]
 
 
-def _ensure_int_labels(y: np.ndarray) -> np.ndarray:
-    y = np.asarray(y)
-    if y.dtype.kind in {"U", "S", "O"}:
-        _, inv = np.unique(y.astype(str), return_inverse=True)
-        return inv.astype(int)
-    if y.dtype.kind == "f":
-        # labels should be discrete; coerce to int safely
-        return np.rint(y).astype(int)
-    return y.astype(int)
-
-
 def _pick_label_column(df: pd.DataFrame, preferred: Optional[str] = None) -> Optional[str]:
     if preferred and preferred in df.columns:
         return preferred
     candidates = _candidate_label_columns(df)
     if not candidates:
         return None
-    # prioritize common names and low cardinality
+
     def score(c: str) -> tuple[int, int, int]:
         nc = _normalize_name(c)
         exact = 0 if nc in KNOWN_LABEL_NAMES or nc.endswith("_label") or nc.endswith("_labels") else 1
         cardinality = _unique_nonnull_count(df[c])
-        # lower is better for labels, but avoid trivial binary meta columns if possible
         return (exact, cardinality, len(c))
+
     candidates = sorted(candidates, key=score)
     return candidates[0]
 
@@ -230,7 +227,6 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
     if label_col is None:
         raise ValueError(f"Could not detect a label column in {path.name}")
 
-    # special case: if file is a manifest with file paths, resolve and load referenced files
     path_like_cols = [c for c in df.columns if _normalize_name(c) in KNOWN_PATH_NAMES]
     if path_like_cols and len(emg_cols) < 3:
         records: List[SubjectDataset] = []
@@ -249,7 +245,6 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
         if records:
             return records
 
-    # generic sample-level/subject-level CSV
     label_vals = _ensure_int_labels(df[label_col].to_numpy())
     if subject_col:
         subject_vals = _coerce_str_series(df[subject_col])
@@ -265,7 +260,6 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
     gait_vals = df[gait_percent_col].to_numpy(dtype=float) if gait_percent_col else None
     sample_vals = df[sample_index_col].to_numpy(dtype=int) if sample_index_col else np.arange(len(df), dtype=int)
 
-    # some files may store multiple subjects; group by subject_id
     out: List[SubjectDataset] = []
     grouped = df.assign(_subject_id=subject_vals, _label=label_vals)
     if cycle_vals is not None:
@@ -288,7 +282,6 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
             "emg_columns": emg_cols,
             "all_columns": list(df.columns),
         }
-        # attach any extra phase label columns for later use
         for extra_col in _candidate_label_columns(df):
             if extra_col == label_col:
                 continue
@@ -312,6 +305,475 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
     return out
 
 
+# ===========================================================================
+# JSON manifest-driven windowed dataset (primary target format)
+# ===========================================================================
+#
+# Layout convention:
+#   data_dir/
+#     manifest.csv                 (or *_manifest.csv)
+#       columns: window_path, subject_id, recording_id, window_index,
+#                current_activity, future_activity, transition_flag,
+#                transition_type, time_to_transition, [extra metadata...]
+#     windows/<subject_id>/<recording_id>/<window_index>.json
+#       { "emg": [[...11x400...]], "channel_names": [...] (optional) }
+#
+# Each JSON window tensor is read from disk lazily, on `__getitem__`, so the
+# full 25,338-window corpus is never materialized in RAM at once.
+
+MANIFEST_LABEL_COLUMNS = {
+    "current_activity", "future_activity", "transition_flag",
+    "transition_type", "time_to_transition",
+}
+MANIFEST_REQUIRED_COLUMNS = {"window_path", "subject_id"}
+
+
+def _find_manifest_csv(data_dir: Path) -> Optional[Path]:
+    candidates = sorted(data_dir.glob("*manifest*.csv"))
+    if candidates:
+        return candidates[0]
+    direct = data_dir / "manifest.csv"
+    return direct if direct.exists() else None
+
+
+def _resolve_window_path(data_dir: Path, raw_path: str) -> Path:
+    p = Path(str(raw_path))
+    return p if p.is_absolute() else (data_dir / p)
+
+
+@dataclass
+class JSONWindowRecord:
+    """One row of the manifest: pointer to a JSON tensor plus its labels."""
+    window_path: Path
+    subject_id: str
+    recording_id: str
+    window_index: int
+    current_activity: int
+    future_activity: int
+    transition_flag: int
+    transition_type: int
+    time_to_transition: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class WindowValidationError(ValueError):
+    pass
+
+
+def _validate_emg_tensor(arr: np.ndarray, expected_shape: Tuple[int, int] = EMG_WINDOW_SHAPE, *, source: str = "") -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape != expected_shape:
+        raise WindowValidationError(f"{source}: expected shape {expected_shape}, got {arr.shape}")
+    if np.isnan(arr).any():
+        raise WindowValidationError(f"{source}: contains NaN values")
+    if np.isinf(arr).any():
+        raise WindowValidationError(f"{source}: contains Inf values")
+    return arr
+
+
+def _validate_manifest_row(row: pd.Series, source: str = "") -> None:
+    for col in MANIFEST_REQUIRED_COLUMNS:
+        if col not in row or pd.isna(row[col]):
+            raise WindowValidationError(f"{source}: malformed metadata, missing required field {col!r}")
+    for col in MANIFEST_LABEL_COLUMNS:
+        if col in row and pd.notna(row[col]):
+            val = row[col]
+            if col == "time_to_transition":
+                if not np.isfinite(float(val)):
+                    raise WindowValidationError(f"{source}: non-finite time_to_transition")
+            else:
+                try:
+                    int(val)
+                except (TypeError, ValueError):
+                    raise WindowValidationError(f"{source}: non-integer label in column {col!r}")
+
+
+def discover_json_manifest(data_dir: Path) -> Optional[Path]:
+    """Automatic dataset discovery: locate the manifest CSV that indexes a JSON window corpus."""
+    data_dir = Path(data_dir)
+    if not data_dir.exists():
+        return None
+    return _find_manifest_csv(data_dir)
+
+
+def load_json_manifest(
+    data_dir: Path,
+    manifest_path: Optional[Path] = None,
+    validate: bool = True,
+) -> List[JSONWindowRecord]:
+    """
+    Parses the manifest CSV into a list of lightweight ``JSONWindowRecord``
+    pointers (no tensor data is loaded here — that happens lazily inside
+    ``JSONDataset.__getitem__``).
+    """
+    data_dir = Path(data_dir)
+    manifest_path = Path(manifest_path) if manifest_path is not None else _find_manifest_csv(data_dir)
+    if manifest_path is None or not manifest_path.exists():
+        raise FileNotFoundError(f"No manifest CSV found under {data_dir}")
+
+    df = pd.read_csv(manifest_path)
+    df.columns = [_normalize_name(c) if _normalize_name(c) in (MANIFEST_LABEL_COLUMNS | MANIFEST_REQUIRED_COLUMNS | {"recording_id", "window_index"}) else c for c in df.columns]
+
+    records: List[JSONWindowRecord] = []
+    known_cols = MANIFEST_REQUIRED_COLUMNS | MANIFEST_LABEL_COLUMNS | {"recording_id", "window_index"}
+
+    for i, row in df.iterrows():
+        source = f"{manifest_path.name}:row{i}"
+        if validate:
+            _validate_manifest_row(row, source=source)
+
+        extra_meta = {c: row[c] for c in df.columns if c not in known_cols and pd.notna(row[c])}
+
+        records.append(JSONWindowRecord(
+            window_path=_resolve_window_path(data_dir, row["window_path"]),
+            subject_id=str(row["subject_id"]),
+            recording_id=str(row.get("recording_id", row["subject_id"])),
+            window_index=int(row.get("window_index", i)),
+            current_activity=int(row.get("current_activity", -1)) if pd.notna(row.get("current_activity", np.nan)) else -1,
+            future_activity=int(row.get("future_activity", -1)) if pd.notna(row.get("future_activity", np.nan)) else -1,
+            transition_flag=int(row.get("transition_flag", 0)) if pd.notna(row.get("transition_flag", np.nan)) else 0,
+            transition_type=int(row.get("transition_type", 0)) if pd.notna(row.get("transition_type", np.nan)) else 0,
+            time_to_transition=float(row.get("time_to_transition", 0.0)) if pd.notna(row.get("time_to_transition", np.nan)) else 0.0,
+            metadata=extra_meta,
+        ))
+
+    return records
+
+
+def _read_json_window(path: Path, expected_shape: Tuple[int, int] = EMG_WINDOW_SHAPE) -> Tuple[np.ndarray, List[str]]:
+    if not path.exists():
+        raise FileNotFoundError(f"JSON window tensor not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, dict):
+        emg = payload.get("emg", payload.get("X"))
+        channel_names = payload.get("channel_names", [f"ch_{i+1}" for i in range(expected_shape[0])])
+    else:
+        emg = payload
+        channel_names = [f"ch_{i+1}" for i in range(expected_shape[0])]
+    arr = _validate_emg_tensor(np.asarray(emg), expected_shape=expected_shape, source=str(path))
+    return arr, list(channel_names)
+
+
+class JSONDataset(Dataset):
+    """
+    PyTorch ``Dataset`` over a JSON-tensor EMG window corpus indexed by a
+    manifest CSV. Designed for the 25,338-window / 11×400 corpus, but works
+    for any manifest-described JSON window collection.
+
+    Tensors are read from disk lazily inside ``__getitem__`` — nothing is
+    preloaded into RAM at construction time, so this scales to corpora far
+    larger than available memory. Combine with ``num_workers > 0`` and
+    ``pin_memory=True`` (see ``build_dataloader``) for GPU-friendly batching.
+
+    Each sample is a dict with keys:
+        emg, current_activity, future_activity, transition_flag,
+        transition_type, time_to_transition, subject_id, recording_id,
+        window_index, metadata
+    """
+
+    def __init__(
+        self,
+        records: Sequence[JSONWindowRecord],
+        expected_shape: Tuple[int, int] = EMG_WINDOW_SHAPE,
+        transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        validate_on_load: bool = True,
+    ) -> None:
+        self.records = list(records)
+        self.expected_shape = expected_shape
+        self.transform = transform
+        self.validate_on_load = validate_on_load
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[idx]
+        emg, channel_names = _read_json_window(rec.window_path, expected_shape=self.expected_shape)
+        if self.transform is not None:
+            emg = self.transform(emg)
+
+        return {
+            "emg": torch.from_numpy(np.ascontiguousarray(emg, dtype=np.float32)),
+            "current_activity": torch.tensor(rec.current_activity, dtype=torch.long),
+            "future_activity": torch.tensor(rec.future_activity, dtype=torch.long),
+            "transition_flag": torch.tensor(rec.transition_flag, dtype=torch.long),
+            "transition_type": torch.tensor(rec.transition_type, dtype=torch.long),
+            "time_to_transition": torch.tensor(rec.time_to_transition, dtype=torch.float32),
+            "subject_id": rec.subject_id,
+            "recording_id": rec.recording_id,
+            "window_index": rec.window_index,
+            "metadata": rec.metadata,
+            "channel_names": channel_names,
+        }
+
+    # ------------------------------------------------------------------
+    # Subject-aware helpers (mirrors SubjectDataset-level grouping)
+    # ------------------------------------------------------------------
+
+    def subject_ids(self) -> np.ndarray:
+        return np.array([r.subject_id for r in self.records], dtype=object)
+
+    def filter_by_subjects(self, subject_ids: Iterable[str]) -> "JSONDataset":
+        keep = set(subject_ids)
+        filtered = [r for r in self.records if r.subject_id in keep]
+        return JSONDataset(filtered, expected_shape=self.expected_shape, transform=self.transform, validate_on_load=self.validate_on_load)
+
+    def to_subject_datasets(self) -> List[SubjectDataset]:
+        """
+        Materializes this JSON corpus into the legacy ``SubjectDataset``
+        in-memory representation, for code paths that have not yet been
+        ported to the lazy ``JSONDataset`` (e.g. NMF fitting). This call
+        does load all tensors into RAM — only use for corpora that fit.
+        """
+        by_subject: Dict[str, List[int]] = {}
+        for i, r in enumerate(self.records):
+            by_subject.setdefault(r.subject_id, []).append(i)
+
+        out: List[SubjectDataset] = []
+        for subject_id, indices in by_subject.items():
+            ordered = sorted(indices, key=lambda i: (self.records[i].recording_id, self.records[i].window_index))
+            X_rows = []
+            y_rows = []
+            for i in ordered:
+                rec = self.records[i]
+                emg, channel_names = _read_json_window(rec.window_path, expected_shape=self.expected_shape)
+                X_rows.append(emg.reshape(emg.shape[0], -1).mean(axis=1))
+                y_rows.append(rec.current_activity)
+            X = np.vstack(X_rows) if X_rows else np.empty((0, self.expected_shape[0]))
+            y = np.asarray(y_rows, dtype=int)
+            out.append(SubjectDataset(
+                subject_id=subject_id,
+                X=X,
+                y=y,
+                channel_names=[f"ch_{i+1}" for i in range(self.expected_shape[0])],
+                source_file=str(self.records[ordered[0]].window_path) if ordered else None,
+                metadata={"format": "json_manifest"},
+            ))
+        return out
+
+
+def json_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Custom ``collate_fn`` for ``JSONDataset`` batches. Stacks tensor fields
+    and groups string/dict metadata fields into lists, since the default
+    PyTorch collate cannot stack heterogeneous metadata dicts.
+    """
+    out: Dict[str, Any] = {}
+    tensor_keys = [
+        "emg", "current_activity", "future_activity",
+        "transition_flag", "transition_type", "time_to_transition",
+    ]
+    for k in tensor_keys:
+        out[k] = torch.stack([b[k] for b in batch], dim=0)
+    out["subject_id"] = [b["subject_id"] for b in batch]
+    out["recording_id"] = [b["recording_id"] for b in batch]
+    out["window_index"] = [b["window_index"] for b in batch]
+    out["metadata"] = [b["metadata"] for b in batch]
+    out["channel_names"] = batch[0]["channel_names"] if batch else []
+    return out
+
+
+def build_dataloader(
+    dataset: JSONDataset,
+    batch_size: int = 64,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    drop_last: bool = False,
+    persistent_workers: Optional[bool] = None,
+) -> DataLoader:
+    """
+    Constructs a GPU-friendly ``DataLoader`` for a ``JSONDataset``:
+    multi-worker lazy disk reads, pinned host memory for fast
+    host→device transfer, and the dedicated ``json_collate_fn``.
+    """
+    persistent = persistent_workers if persistent_workers is not None else (num_workers > 0)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=drop_last,
+        collate_fn=json_collate_fn,
+        persistent_workers=persistent and num_workers > 0,
+    )
+
+
+# ===========================================================================
+# Cross-validation splitting over JSON manifest records (subject-level)
+# ===========================================================================
+
+def json_leave_one_subject_out(
+    records: Sequence[JSONWindowRecord],
+) -> Iterable[Tuple[str, List[JSONWindowRecord], List[JSONWindowRecord]]]:
+    unique = sorted({r.subject_id for r in records})
+    for held_out in unique:
+        train = [r for r in records if r.subject_id != held_out]
+        test = [r for r in records if r.subject_id == held_out]
+        yield held_out, train, test
+
+
+def json_group_kfold_splits(
+    records: Sequence[JSONWindowRecord],
+    n_splits: int = 5,
+) -> Iterable[Tuple[List[JSONWindowRecord], List[JSONWindowRecord]]]:
+    groups = np.array([r.subject_id for r in records], dtype=object)
+    n_splits = min(n_splits, max(2, len(set(groups.tolist()))))
+    splitter = GroupKFold(n_splits=n_splits)
+    X_dummy = np.zeros((len(records), 1))
+    for train_idx, test_idx in splitter.split(X_dummy, groups=groups):
+        yield [records[i] for i in train_idx], [records[i] for i in test_idx]
+
+
+def json_holdout_split(
+    records: Sequence[JSONWindowRecord],
+    test_size: float = 0.2,
+    val_size: float = 0.2,
+    random_state: int = 42,
+) -> Tuple[List[JSONWindowRecord], List[JSONWindowRecord], List[JSONWindowRecord]]:
+    subject_ids = sorted({r.subject_id for r in records})
+    if len(subject_ids) < 3:
+        train, test = train_test_split(list(records), test_size=test_size, random_state=random_state, shuffle=True)
+        train, val = train_test_split(train, test_size=val_size, random_state=random_state, shuffle=True)
+        return list(train), list(val), list(test)
+
+    train_ids, test_ids = train_test_split(subject_ids, test_size=test_size, random_state=random_state, shuffle=True)
+    train_ids, val_ids = train_test_split(train_ids, test_size=val_size, random_state=random_state, shuffle=True)
+    train_ids, val_ids, test_ids = set(train_ids), set(val_ids), set(test_ids)
+    train = [r for r in records if r.subject_id in train_ids]
+    val = [r for r in records if r.subject_id in val_ids]
+    test = [r for r in records if r.subject_id in test_ids]
+    return train, val, test
+
+
+# ===========================================================================
+# DatasetFactory — unified entry point across JSON / CSV / NPZ
+# ===========================================================================
+
+class DatasetFactory:
+    """
+    Single entry point for dataset discovery and construction. Detects
+    whether ``data_dir`` contains a JSON-manifest corpus, legacy CSV
+    manifests, or NPZ files, and dispatches accordingly. ``load_dataset``
+    (the original public API) remains a thin wrapper around this factory
+    for backward compatibility.
+    """
+
+    def __init__(self, data_dir: Path) -> None:
+        self.data_dir = Path(data_dir)
+
+    def detect_format(self) -> str:
+        if discover_json_manifest(self.data_dir) is not None:
+            return "json"
+        files = _candidate_data_files(self.data_dir)
+        if any(f.suffix.lower() == ".npz" for f in files):
+            return "npz"
+        if any(f.suffix.lower() == ".csv" for f in files):
+            return "csv"
+        raise FileNotFoundError(f"No supported dataset files found in {self.data_dir}")
+
+    def load_subject_datasets(self) -> List[SubjectDataset]:
+        """Legacy in-memory SubjectDataset representation (any format)."""
+        fmt = self.detect_format()
+        if fmt == "json":
+            records = load_json_manifest(self.data_dir)
+            return JSONDataset(records).to_subject_datasets()
+        return _load_legacy_dataset(self.data_dir)
+
+    def load_json_dataset(
+        self,
+        manifest_path: Optional[Path] = None,
+        validate: bool = True,
+    ) -> JSONDataset:
+        records = load_json_manifest(self.data_dir, manifest_path=manifest_path, validate=validate)
+        return JSONDataset(records)
+
+    def build_dataloaders(
+        self,
+        batch_size: int = 64,
+        cv: str = "loso",
+        n_splits: int = 5,
+        val_size: float = 0.2,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+    ) -> Iterable[Tuple[str, DataLoader, DataLoader, DataLoader]]:
+        """
+        Yields ``(fold_name, train_loader, val_loader, test_loader)`` tuples
+        for the requested cross-validation scheme, operating directly on the
+        lazy JSON dataset (no full in-RAM materialization).
+        """
+        full = self.load_json_dataset()
+        records = full.records
+
+        def _make_loaders(train_r, val_r, test_r, shuffle_train=True):
+            train_ds = JSONDataset(train_r, expected_shape=full.expected_shape)
+            val_ds = JSONDataset(val_r, expected_shape=full.expected_shape)
+            test_ds = JSONDataset(test_r, expected_shape=full.expected_shape)
+            return (
+                build_dataloader(train_ds, batch_size=batch_size, shuffle=shuffle_train, num_workers=num_workers, pin_memory=pin_memory),
+                build_dataloader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory),
+                build_dataloader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory),
+            )
+
+        if cv == "loso":
+            for held_out, train_r, test_r in json_leave_one_subject_out(records):
+                train_ids = sorted({r.subject_id for r in train_r})
+                if len(train_ids) >= 2:
+                    val_subj = train_ids[: max(1, int(round(len(train_ids) * val_size)))]
+                    val_r = [r for r in train_r if r.subject_id in set(val_subj)]
+                    train_r2 = [r for r in train_r if r.subject_id not in set(val_subj)]
+                else:
+                    val_r, train_r2 = [], train_r
+                yield (f"loso_{held_out}",) + _make_loaders(train_r2, val_r, test_r)
+        elif cv == "groupkfold":
+            for i, (train_r, test_r) in enumerate(json_group_kfold_splits(records, n_splits=n_splits)):
+                train_ids = sorted({r.subject_id for r in train_r})
+                val_subj = train_ids[: max(1, int(round(len(train_ids) * val_size)))] if len(train_ids) >= 2 else []
+                val_r = [r for r in train_r if r.subject_id in set(val_subj)]
+                train_r2 = [r for r in train_r if r.subject_id not in set(val_subj)]
+                yield (f"fold_{i+1}",) + _make_loaders(train_r2, val_r, test_r)
+        else:
+            train_r, val_r, test_r = json_holdout_split(records, test_size=test_size, val_size=val_size, random_state=random_state)
+            yield ("holdout",) + _make_loaders(train_r, val_r, test_r)
+
+
+def _load_legacy_dataset(data_dir: Path) -> List[SubjectDataset]:
+    if not data_dir.exists():
+        raise FileNotFoundError(f"{data_dir} does not exist")
+    files = _candidate_data_files(data_dir)
+    if not files:
+        raise FileNotFoundError(f"No CSV/NPZ files found in {data_dir}")
+
+    sample_level = [f for f in files if f.name.lower() == "sample_level_dataset.csv"]
+    if sample_level:
+        files = sample_level
+
+    subjects: List[SubjectDataset] = []
+    for path in files:
+        try:
+            subjects.extend(load_subject_file(path))
+        except Exception as exc:
+            subjects.append(
+                SubjectDataset(
+                    subject_id=path.stem,
+                    X=np.empty((0, 0)),
+                    y=np.empty((0,), dtype=int),
+                    channel_names=[],
+                    source_file=str(path),
+                    metadata={"load_error": str(exc)},
+                )
+            )
+
+    subjects = [s for s in subjects if s.X.size > 0 and len(s.y) > 0]
+    if not subjects:
+        raise FileNotFoundError(f"No usable datasets could be loaded from {data_dir}")
+    return _merge_subject_datasets(subjects)
+
+
 def load_subject_file(path: Path, preferred_label: Optional[str] = None) -> List[SubjectDataset]:
     suffix = path.suffix.lower()
     if suffix == ".npz":
@@ -326,7 +788,6 @@ def _candidate_data_files(data_dir: Path) -> List[Path]:
     for p in data_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() in {".csv", ".npz"}:
             files.append(p)
-    # prefer manifests first; loader will resolve referenced files if present
     priority = {"cycle_manifest.csv": 0, "sample_level_dataset.csv": 1, "phase2_labels.csv": 2, "phase4_labels.csv": 2, "phase7_labels.csv": 2}
     return sorted(files, key=lambda p: (priority.get(p.name.lower(), 99), str(p).lower()))
 
@@ -342,7 +803,6 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
             out.append(items[0])
             continue
 
-        # ensure same channel layout; if not, intersect common columns
         channel_sets = [tuple(x.channel_names) for x in items]
         if len(set(channel_sets)) == 1:
             channel_names = list(items[0].channel_names)
@@ -357,7 +817,6 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
             out.append(SubjectDataset(subject_id, X, y, channel_names, cycle_id, gait_percent, sample_index, items[0].source_file, metadata))
             continue
 
-        # align by common columns
         common = list(set(items[0].channel_names).intersection(*[set(x.channel_names) for x in items[1:]]))
         common = sorted(common, key=lambda c: items[0].channel_names.index(c))
         aligned_X = []
@@ -387,37 +846,13 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
 
 
 def load_dataset(data_dir: Path) -> List[SubjectDataset]:
-    if not data_dir.exists():
-        raise FileNotFoundError(f"{data_dir} does not exist")
-    files = _candidate_data_files(data_dir)
-    if not files:
-        raise FileNotFoundError(f"No CSV/NPZ files found in {data_dir}")
-
-    sample_level = [f for f in files if f.name.lower() == "sample_level_dataset.csv"]
-    if sample_level:
-        files = sample_level
-
-    subjects: List[SubjectDataset] = []
-    for path in files:
-        try:
-            subjects.extend(load_subject_file(path))
-        except Exception as exc:
-            # keep going for discovery; raise only if everything fails later
-            subjects.append(
-                SubjectDataset(
-                    subject_id=path.stem,
-                    X=np.empty((0, 0)),
-                    y=np.empty((0,), dtype=int),
-                    channel_names=[],
-                    source_file=str(path),
-                    metadata={"load_error": str(exc)},
-                )
-            )
-
-    subjects = [s for s in subjects if s.X.size > 0 and len(s.y) > 0]
-    if not subjects:
-        raise FileNotFoundError(f"No usable datasets could be loaded from {data_dir}")
-    return _merge_subject_datasets(subjects)
+    """
+    Public, backward-compatible entry point. Auto-detects JSON-manifest,
+    CSV, or NPZ format under ``data_dir`` and returns the legacy
+    ``SubjectDataset`` in-memory representation consumed by pipeline.py.
+    """
+    factory = DatasetFactory(Path(data_dir))
+    return factory.load_subject_datasets()
 
 
 def make_forecast_target(y: np.ndarray, horizon_steps: int) -> np.ndarray:
@@ -449,7 +884,6 @@ def temporal_train_val_test_split(
     subject_ids = np.array([s.subject_id for s in subjects], dtype=object)
     unique = np.array(sorted(set(subject_ids.tolist())), dtype=object)
     if len(unique) < 3:
-        # fallback: split samples within available subjects
         train_subjects, test_subjects = train_test_split(list(subjects), test_size=test_size, random_state=random_state, shuffle=True)
         train_subjects, val_subjects = train_test_split(train_subjects, test_size=val_size, random_state=random_state, shuffle=True)
         return list(train_subjects), list(val_subjects), list(test_subjects)
