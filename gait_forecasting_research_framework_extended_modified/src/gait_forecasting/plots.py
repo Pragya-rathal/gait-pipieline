@@ -496,3 +496,281 @@ def plot_deployment_comparison(df, path: Path, title: str = "Deployment comparis
         ax.axis("off")
     fig.suptitle(title)
     _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_cross_validation_summary(
+    fold_metrics: Sequence[Mapping[str, float]],
+    path: str | Path = "cv_summary.png",
+    metric_keys: Sequence[str] = ("accuracy", "macro_f1", "weighted_f1"),
+    title: str = "Cross-Validation Summary",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    if not fold_metrics:
+        return
+    fig, axes = plt.subplots(1, len(metric_keys), figsize=(5 * len(metric_keys), 4.5), squeeze=False)
+    for col, key in enumerate(metric_keys):
+        ax = axes[0, col]
+        vals = [float(m.get(key, float("nan"))) for m in fold_metrics]
+        folds = [f"F{i+1}" for i in range(len(vals))]
+        ax.bar(folds, vals, color=_COLOR_CYCLE[col % len(_COLOR_CYCLE)])
+        mean = np.nanmean(vals)
+        ax.axhline(mean, linestyle="--", linewidth=1.5, color="0.3", label=f"mean={mean:.3f}")
+        ax.set_title(_metric_title(key))
+        ax.set_ylim(0, 1)
+        ax.legend(fontsize=8)
+    fig.suptitle(title)
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_loso_summary(
+    subject_metrics: Mapping[str, Mapping[str, float]],
+    path: str | Path = "loso_summary.png",
+    metric_key: str = "accuracy",
+    title: str = "LOSO Summary",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    if not subject_metrics:
+        return
+    subjects = list(subject_metrics.keys())
+    vals = [float(subject_metrics[s].get(metric_key, float("nan"))) for s in subjects]
+    fig, ax = plt.subplots(figsize=(max(8, 0.7 * len(subjects)), 5))
+    ax.bar(subjects, vals, color=_COLOR_CYCLE[0])
+    mean = np.nanmean(vals)
+    ax.axhline(mean, linestyle="--", linewidth=1.5, color="0.3", label=f"mean={mean:.3f}")
+    ax.set_title(title)
+    ax.set_xlabel("Subject")
+    ax.set_ylabel(_metric_title(metric_key))
+    ax.tick_params(axis="x", rotation=45)
+    ax.set_ylim(0, 1)
+    ax.legend()
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_learning_rate_schedule(
+    lr_values: Sequence[float],
+    path: str | Path = "lr_schedule.png",
+    epochs: Sequence[int] | None = None,
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    x = list(epochs) if epochs is not None else list(range(1, len(lr_values) + 1))
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(x, lr_values, linewidth=2.2, color=_COLOR_CYCLE[2])
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate")
+    ax.set_title("Learning Rate Schedule")
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_synergy_heatmap(
+    H: np.ndarray,
+    path: str | Path = "synergy_heatmap.png",
+    title: str = "Synergy Activation Heatmap",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    H = np.asarray(H, dtype=float)
+    fig, ax = plt.subplots(figsize=(max(8, H.shape[0] / 50), max(4, H.shape[1] * 0.5 + 1)))
+    im = ax.imshow(H.T, aspect="auto", origin="lower", cmap="hot")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Synergy")
+    ax.set_yticks(np.arange(H.shape[1]))
+    ax.set_yticklabels([f"H{i+1}" for i in range(H.shape[1])])
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, label="Activation")
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_dynamic_synergy_features(
+    H: np.ndarray,
+    dH: np.ndarray,
+    path: str | Path = "dynamic_synergy_features.png",
+    d2H: np.ndarray | None = None,
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    H = np.asarray(H, dtype=float)
+    dH = np.asarray(dH, dtype=float)
+    nrows = 3 if d2H is not None else 2
+    fig, axes = plt.subplots(nrows, 1, figsize=(10, 3 * nrows), sharex=True)
+    x = np.arange(H.shape[0])
+    for i in range(H.shape[1]):
+        axes[0].plot(x, H[:, i], linewidth=1.4, label=f"H{i+1}")
+        axes[1].plot(x, dH[:, i], linewidth=1.2, label=f"dH{i+1}")
+    axes[0].set_title("Synergy Activations H(t)")
+    axes[0].set_ylabel("H")
+    axes[1].set_title("Synergy Velocities dH/dt")
+    axes[1].set_ylabel("dH")
+    if d2H is not None:
+        d2H = np.asarray(d2H, dtype=float)
+        for i in range(d2H.shape[1]):
+            axes[2].plot(x, d2H[:, i], linewidth=1.2, label=f"d²H{i+1}")
+        axes[2].set_title("Synergy Accelerations d²H/dt²")
+        axes[2].set_ylabel("d²H")
+    axes[-1].set_xlabel("Sample")
+    for ax in axes:
+        ax.legend(ncols=min(4, H.shape[1]), fontsize=8)
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_benchmark_comparison(
+    results: Sequence[Any],
+    path: str | Path = "benchmark_comparison.png",
+    metrics: Sequence[str] = (
+        "inference_latency_ms", "throughput_samples_per_s",
+        "n_params", "model_size_mb", "vram_used_mb",
+    ),
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    if not results:
+        return
+    rows = [r.to_dict() if hasattr(r, "to_dict") else dict(r) for r in results]
+    model_names = [r.get("model_name", str(i)) for i, r in enumerate(rows)]
+    valid_metrics = [m for m in metrics if any(m in r for r in rows)]
+    if not valid_metrics:
+        return
+    ncols = min(3, len(valid_metrics))
+    nrows = int(np.ceil(len(valid_metrics) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 4.2 * nrows), squeeze=False)
+    for idx, metric in enumerate(valid_metrics):
+        ax = axes[idx // ncols, idx % ncols]
+        vals = [float(r.get(metric, 0) or 0) for r in rows]
+        ax.bar(model_names, vals, color=_COLOR_CYCLE[idx % len(_COLOR_CYCLE)])
+        ax.set_title(_metric_title(metric))
+        ax.tick_params(axis="x", rotation=55)
+    for idx in range(len(valid_metrics), nrows * ncols):
+        axes[idx // ncols, idx % ncols].axis("off")
+    fig.suptitle("Architecture Benchmark Comparison")
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_inference_latency_distribution(
+    latencies_ms: Sequence[float],
+    path: str | Path = "inference_latency_distribution.png",
+    bins: int = 30,
+    title: str = "Inference Latency Distribution",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    latencies = np.asarray(latencies_ms, dtype=float)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.hist(latencies, bins=bins, color=_COLOR_CYCLE[0], alpha=0.85)
+    mean = float(np.mean(latencies))
+    p95 = float(np.percentile(latencies, 95))
+    ax.axvline(mean, linestyle="--", color=_COLOR_CYCLE[1], linewidth=1.8, label=f"mean={mean:.2f} ms")
+    ax.axvline(p95, linestyle=":", color=_COLOR_CYCLE[3], linewidth=1.8, label=f"p95={p95:.2f} ms")
+    ax.set_xlabel("Latency (ms)")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.legend()
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_gpu_memory_usage(
+    model_names: Sequence[str],
+    vram_mb: Sequence[float],
+    path: str | Path = "gpu_memory_usage.png",
+    ram_mb: Sequence[float] | None = None,
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    x = np.arange(len(model_names))
+    width = 0.4 if ram_mb is not None else 0.7
+    fig, ax = plt.subplots(figsize=(max(8, 0.8 * len(model_names)), 5))
+    bars = ax.bar(x - (width / 2 if ram_mb is not None else 0), vram_mb, width, label="VRAM (MB)", color=_COLOR_CYCLE[0])
+    if ram_mb is not None:
+        ax.bar(x + width / 2, ram_mb, width, label="RAM (MB)", color=_COLOR_CYCLE[1])
+        ax.legend()
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha="right")
+    ax.set_ylabel("Memory (MB)")
+    ax.set_title("GPU / CPU Memory Usage")
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_parameter_count(
+    model_names: Sequence[str],
+    param_counts: Sequence[int],
+    path: str | Path = "parameter_count.png",
+    model_sizes_mb: Sequence[float] | None = None,
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    x = np.arange(len(model_names))
+    width = 0.4 if model_sizes_mb is not None else 0.7
+    fig, ax = plt.subplots(figsize=(max(8, 0.8 * len(model_names)), 5))
+    ax.bar(x - (width / 2 if model_sizes_mb is not None else 0), param_counts, width, label="Parameters", color=_COLOR_CYCLE[0])
+    ax.set_ylabel("Parameter Count")
+    ax.set_title("Model Parameter Counts")
+    if model_sizes_mb is not None:
+        ax2 = ax.twinx()
+        ax2.bar(x + width / 2, model_sizes_mb, width, label="Size (MB)", color=_COLOR_CYCLE[1], alpha=0.7)
+        ax2.set_ylabel("Model size (MB)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha="right")
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_flops_comparison(
+    model_names: Sequence[str],
+    flops: Sequence[float],
+    path: str | Path = "flops_comparison.png",
+    title: str = "Approximate FLOPs Comparison",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    fig, ax = plt.subplots(figsize=(max(8, 0.8 * len(model_names)), 5))
+    ax.bar(model_names, flops, color=_COLOR_CYCLE[2])
+    ax.set_yscale("log")
+    ax.set_ylabel("FLOPs (log scale)")
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=45)
+    _finalize(fig, path, dpi=dpi, formats=formats)
+
+
+def plot_ablation_study(
+    results: Mapping[str, Mapping[str, float]],
+    path: str | Path = "ablation_study.png",
+    baseline_key: str | None = None,
+    metric_key: str = "accuracy",
+    title: str = "Ablation Study",
+    dpi: int = 300,
+    formats: Sequence[str] | None = None,
+) -> None:
+    _apply_style()
+    variants = list(results.keys())
+    vals = [float(results[v].get(metric_key, float("nan"))) for v in variants]
+    colors = []
+    baseline_val = None
+    if baseline_key and baseline_key in results:
+        baseline_val = float(results[baseline_key].get(metric_key, float("nan")))
+    for v, val in zip(variants, vals):
+        if v == baseline_key:
+            colors.append(_COLOR_CYCLE[0])
+        elif baseline_val is not None and val < baseline_val:
+            colors.append(_COLOR_CYCLE[3])
+        else:
+            colors.append(_COLOR_CYCLE[2])
+    fig, ax = plt.subplots(figsize=(max(8, 1.2 * len(variants)), 5))
+    ax.bar(variants, vals, color=colors)
+    if baseline_val is not None:
+        ax.axhline(baseline_val, linestyle="--", color="0.3", linewidth=1.5, label=f"Baseline={baseline_val:.3f}")
+        ax.legend()
+    ax.set_ylabel(_metric_title(metric_key))
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=40)
+    _finalize(fig, path, dpi=dpi, formats=formats)
