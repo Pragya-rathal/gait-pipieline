@@ -154,13 +154,39 @@ def _coerce_str_series(s: pd.Series) -> np.ndarray:
 
 
 def _ensure_int_labels(y: np.ndarray) -> np.ndarray:
+    """Convert label array to int, raising ValueError on NaN/non-finite values."""
     y = np.asarray(y)
     if y.dtype.kind in {"U", "S", "O"}:
         _, inv = np.unique(y.astype(str), return_inverse=True)
         return inv.astype(int)
     if y.dtype.kind == "f":
+        if np.any(~np.isfinite(y)):
+            raise ValueError(
+                f"Label array contains NaN or Inf values: {y[~np.isfinite(y)]}. "
+                "Remove or impute invalid labels before constructing SubjectDataset."
+            )
         return np.rint(y).astype(int)
     return y.astype(int)
+
+
+def _ensure_int_labels_safe(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert label array to int, returning (int_labels, valid_mask).
+    Rows with NaN/Inf are flagged in the mask (False = invalid)."""
+    y = np.asarray(y)
+    if y.dtype.kind in {"U", "S", "O"}:
+        int_labels = np.zeros(len(y), dtype=int)
+        valid_mask = np.ones(len(y), dtype=bool)
+        try:
+            _, inv = np.unique(y.astype(str), return_inverse=True)
+            int_labels = inv.astype(int)
+        except Exception:
+            valid_mask[:] = False
+        return int_labels, valid_mask
+    if y.dtype.kind == "f":
+        valid_mask = np.isfinite(y)
+        int_labels = np.where(valid_mask, np.rint(y).astype(int), -1)
+        return int_labels, valid_mask
+    return y.astype(int), np.ones(len(y), dtype=bool)
 
 
 def _load_npz(path: Path) -> List[SubjectDataset]:
@@ -176,7 +202,19 @@ def _load_npz(path: Path) -> List[SubjectDataset]:
     cycle_id = np.asarray(data["cycle_id"]) if "cycle_id" in data else None
     gait_percent = np.asarray(data["gait_percent"], dtype=float) if "gait_percent" in data else None
     sample_index = np.asarray(data["sample_index"], dtype=int) if "sample_index" in data else None
-    return [SubjectDataset(subject_id=subject_id, X=X, y=_ensure_int_labels(y), channel_names=channel_names, cycle_id=cycle_id, gait_percent=gait_percent, sample_index=sample_index, source_file=str(path))]
+    int_labels, valid_mask = _ensure_int_labels_safe(y)
+    if not np.all(valid_mask):
+        X = X[valid_mask]
+        int_labels = int_labels[valid_mask]
+        if cycle_id is not None:
+            cycle_id = cycle_id[valid_mask]
+        if gait_percent is not None:
+            gait_percent = gait_percent[valid_mask]
+        if sample_index is not None:
+            sample_index = sample_index[valid_mask]
+    if len(X) == 0:
+        raise ValueError(f"{path}: no valid samples remain after filtering NaN labels")
+    return [SubjectDataset(subject_id=subject_id, X=X, y=int_labels, channel_names=channel_names, cycle_id=cycle_id, gait_percent=gait_percent, sample_index=sample_index, source_file=str(path))]
 
 
 def _pick_label_column(df: pd.DataFrame, preferred: Optional[str] = None) -> Optional[str]:
@@ -245,7 +283,13 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
         if records:
             return records
 
-    label_vals = _ensure_int_labels(df[label_col].to_numpy())
+    raw_labels = df[label_col].to_numpy()
+    int_labels, valid_mask = _ensure_int_labels_safe(raw_labels)
+
+    if not np.all(valid_mask):
+        df = df[valid_mask].reset_index(drop=True)
+        int_labels = int_labels[valid_mask]
+
     if subject_col:
         subject_vals = _coerce_str_series(df[subject_col])
         if (
@@ -261,7 +305,7 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
     sample_vals = df[sample_index_col].to_numpy(dtype=int) if sample_index_col else np.arange(len(df), dtype=int)
 
     out: List[SubjectDataset] = []
-    grouped = df.assign(_subject_id=subject_vals, _label=label_vals)
+    grouped = df.assign(_subject_id=subject_vals, _label=int_labels)
     if cycle_vals is not None:
         grouped["_cycle_id"] = cycle_vals
     if gait_vals is not None:
@@ -273,6 +317,8 @@ def _load_tabular_as_subjects(path: Path, preferred_label: Optional[str] = None)
         subdf = _sort_df(subdf, "_cycle_id" if "_cycle_id" in subdf.columns else None, "_gait_percent" if "_gait_percent" in subdf.columns else None, "_sample_index" if "_sample_index" in subdf.columns else None)
         X = subdf[emg_cols].to_numpy(dtype=float)
         y = subdf["_label"].to_numpy(dtype=int)
+        if len(X) == 0:
+            continue
         cycle_id = subdf["_cycle_id"].to_numpy(dtype=object) if "_cycle_id" in subdf.columns else None
         gait_percent = subdf["_gait_percent"].to_numpy(dtype=float) if "_gait_percent" in subdf.columns else None
         sample_index = subdf["_sample_index"].to_numpy(dtype=int) if "_sample_index" in subdf.columns else None
@@ -329,11 +375,27 @@ MANIFEST_REQUIRED_COLUMNS = {"window_path", "subject_id"}
 
 
 def _find_manifest_csv(data_dir: Path) -> Optional[Path]:
-    candidates = sorted(data_dir.glob("*manifest*.csv"))
+    data_dir = Path(data_dir)
+
+    preferred = [
+        data_dir / "manifest" / "dataset_manifest.csv",
+        data_dir / "manifest" / "windows_manifest.csv",
+        data_dir / "metadata" / "window_metadata.csv",
+        data_dir / "dataset_manifest.csv",
+        data_dir / "windows_manifest.csv",
+        data_dir / "manifest.csv",
+    ]
+
+    for path in preferred:
+        if path.exists():
+            return path
+
+    candidates = sorted(data_dir.rglob("*manifest*.csv"))
+
     if candidates:
         return candidates[0]
-    direct = data_dir / "manifest.csv"
-    return direct if direct.exists() else None
+
+    return None
 
 
 def _resolve_window_path(data_dir: Path, raw_path: str) -> Path:
@@ -362,6 +424,10 @@ class WindowValidationError(ValueError):
 
 def _validate_emg_tensor(arr: np.ndarray, expected_shape: Tuple[int, int] = EMG_WINDOW_SHAPE, *, source: str = "") -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        raise WindowValidationError(f"{source}: empty array (size=0)")
+    if arr.ndim != 2:
+        raise WindowValidationError(f"{source}: expected 2D array, got {arr.ndim}D with shape {arr.shape}")
     if arr.shape != expected_shape:
         raise WindowValidationError(f"{source}: expected shape {expected_shape}, got {arr.shape}")
     if np.isnan(arr).any():
@@ -375,6 +441,24 @@ def _validate_manifest_row(row: pd.Series, source: str = "") -> None:
     for col in MANIFEST_REQUIRED_COLUMNS:
         if col not in row or pd.isna(row[col]):
             raise WindowValidationError(f"{source}: malformed metadata, missing required field {col!r}")
+    # Validate subject_id
+    subject_id = row.get("subject_id", None)
+    if subject_id is None or (isinstance(subject_id, float) and np.isnan(subject_id)):
+        raise WindowValidationError(f"{source}: missing or NaN subject_id")
+    # Validate recording_id if present
+    if "recording_id" in row:
+        rec_id = row["recording_id"]
+        if pd.isna(rec_id):
+            raise WindowValidationError(f"{source}: NaN recording_id")
+    # Validate window_index if present
+    if "window_index" in row:
+        w_idx = row["window_index"]
+        if pd.isna(w_idx):
+            raise WindowValidationError(f"{source}: NaN window_index")
+    # Validate window_path exists
+    window_path_raw = row.get("window_path", None)
+    if window_path_raw is None or (isinstance(window_path_raw, float) and np.isnan(window_path_raw)):
+        raise WindowValidationError(f"{source}: missing window_path")
     for col in MANIFEST_LABEL_COLUMNS:
         if col in row and pd.notna(row[col]):
             val = row[col]
@@ -417,15 +501,28 @@ def load_json_manifest(
     records: List[JSONWindowRecord] = []
     known_cols = MANIFEST_REQUIRED_COLUMNS | MANIFEST_LABEL_COLUMNS | {"recording_id", "window_index"}
 
+    skipped = 0
     for i, row in df.iterrows():
         source = f"{manifest_path.name}:row{i}"
         if validate:
-            _validate_manifest_row(row, source=source)
+            try:
+                _validate_manifest_row(row, source=source)
+            except WindowValidationError as exc:
+                skipped += 1
+                continue
+
+        # Verify window_path is not NaN/empty before resolving
+        window_path_raw = row.get("window_path", None)
+        if window_path_raw is None or (isinstance(window_path_raw, float) and np.isnan(window_path_raw)):
+            skipped += 1
+            continue
+
+        resolved_path = _resolve_window_path(data_dir, str(window_path_raw))
 
         extra_meta = {c: row[c] for c in df.columns if c not in known_cols and pd.notna(row[c])}
 
         records.append(JSONWindowRecord(
-            window_path=_resolve_window_path(data_dir, row["window_path"]),
+            window_path=resolved_path,
             subject_id=str(row["subject_id"]),
             recording_id=str(row.get("recording_id", row["subject_id"])),
             window_index=int(row.get("window_index", i)),
@@ -436,6 +533,12 @@ def load_json_manifest(
             time_to_transition=float(row.get("time_to_transition", 0.0)) if pd.notna(row.get("time_to_transition", np.nan)) else 0.0,
             metadata=extra_meta,
         ))
+
+    if not records:
+        raise ValueError(
+            f"No valid manifest rows found in {manifest_path} "
+            f"({skipped} rows skipped due to validation errors)."
+        )
 
     return records
 
@@ -451,7 +554,12 @@ def _read_json_window(path: Path, expected_shape: Tuple[int, int] = EMG_WINDOW_S
     else:
         emg = payload
         channel_names = [f"ch_{i+1}" for i in range(expected_shape[0])]
+    if emg is None:
+        raise WindowValidationError(f"{path}: JSON payload missing 'emg' or 'X' key")
     arr = _validate_emg_tensor(np.asarray(emg), expected_shape=expected_shape, source=str(path))
+    # Guarantee channel_names length matches expected_shape[0]
+    if len(channel_names) != expected_shape[0]:
+        channel_names = [f"ch_{i+1}" for i in range(expected_shape[0])]
     return arr, list(channel_names)
 
 
@@ -525,7 +633,14 @@ class JSONDataset(Dataset):
         in-memory representation, for code paths that have not yet been
         ported to the lazy ``JSONDataset`` (e.g. NMF fitting). This call
         does load all tensors into RAM — only use for corpora that fit.
+
+        Each 11×400 EMG window is reduced to an 11-dimensional feature
+        vector (per-channel RMS amplitude), so X always has shape
+        (number_of_windows, 11) and channel_names always has length 11.
         """
+        n_channels = self.expected_shape[0]
+        standard_channel_names = [f"ch_{i+1}" for i in range(n_channels)]
+
         by_subject: Dict[str, List[int]] = {}
         for i, r in enumerate(self.records):
             by_subject.setdefault(r.subject_id, []).append(i)
@@ -533,23 +648,64 @@ class JSONDataset(Dataset):
         out: List[SubjectDataset] = []
         for subject_id, indices in by_subject.items():
             ordered = sorted(indices, key=lambda i: (self.records[i].recording_id, self.records[i].window_index))
-            X_rows = []
-            y_rows = []
+            X_rows: List[np.ndarray] = []
+            y_rows: List[int] = []
+            skipped = 0
             for i in ordered:
                 rec = self.records[i]
-                emg, channel_names = _read_json_window(rec.window_path, expected_shape=self.expected_shape)
-                X_rows.append(emg.reshape(emg.shape[0], -1).mean(axis=1))
-                y_rows.append(rec.current_activity)
-            X = np.vstack(X_rows) if X_rows else np.empty((0, self.expected_shape[0]))
+                try:
+                    emg, _ = _read_json_window(rec.window_path, expected_shape=self.expected_shape)
+                except (WindowValidationError, FileNotFoundError, ValueError):
+                    skipped += 1
+                    continue
+                # Validate label: skip windows with invalid current_activity
+                label = rec.current_activity
+                if label < 0:
+                    skipped += 1
+                    continue
+                # Reduce 11×400 → 11-dim feature vector via per-channel RMS
+                feature_vec = np.sqrt(np.mean(emg ** 2, axis=1))  # shape (11,)
+                if feature_vec.shape != (n_channels,):
+                    skipped += 1
+                    continue
+                X_rows.append(feature_vec)
+                y_rows.append(label)
+
+            if not X_rows:
+                # Subject has zero valid windows; exclude completely
+                continue
+
+            X = np.vstack(X_rows)  # (N, 11) guaranteed
             y = np.asarray(y_rows, dtype=int)
+
+            # Invariant checks before appending
+            if X.shape[0] != len(y):
+                raise ValueError(
+                    f"Subject {subject_id!r}: X.shape[0]={X.shape[0]} != len(y)={len(y)}"
+                )
+            if X.shape[1] != n_channels:
+                raise ValueError(
+                    f"Subject {subject_id!r}: feature dimension {X.shape[1]} != expected {n_channels}"
+                )
+
             out.append(SubjectDataset(
                 subject_id=subject_id,
                 X=X,
                 y=y,
-                channel_names=[f"ch_{i+1}" for i in range(self.expected_shape[0])],
+                channel_names=standard_channel_names,
                 source_file=str(self.records[ordered[0]].window_path) if ordered else None,
-                metadata={"format": "json_manifest"},
+                metadata={"format": "json_manifest", "skipped_windows": skipped},
             ))
+
+        # Final cross-subject dimension consistency check
+        if out:
+            dims = {s.X.shape[1] for s in out}
+            if len(dims) > 1:
+                raise ValueError(
+                    f"Inconsistent feature dimensions across subjects after materialization: {dims}. "
+                    "All subjects must have the same X.shape[1]."
+                )
+
         return out
 
 
@@ -674,12 +830,26 @@ class DatasetFactory:
             return "csv"
         raise FileNotFoundError(f"No supported dataset files found in {self.data_dir}")
 
+    
+
     def load_subject_datasets(self) -> List[SubjectDataset]:
-        """Legacy in-memory SubjectDataset representation (any format)."""
         fmt = self.detect_format()
+
+        print("=" * 60)
+        print("Detected dataset format:", fmt)
+        print("Dataset directory:", self.data_dir)
+        print("=" * 60)
+
         if fmt == "json":
+            print(">>> Using JSONDataset loader")
             records = load_json_manifest(self.data_dir)
+            print(f"Loaded {len(records)} manifest records")
             return JSONDataset(records).to_subject_datasets()
+
+        print(">>> Using legacy dataset loader")
+        return _load_legacy_dataset(self.data_dir)
+
+        print("Using legacy loader")
         return _load_legacy_dataset(self.data_dir)
 
     def load_json_dataset(
@@ -799,6 +969,11 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
 
     out: List[SubjectDataset] = []
     for subject_id, items in merged.items():
+        # Filter out zero-size items
+        items = [x for x in items if x.X.size > 0 and x.X.ndim == 2 and x.X.shape[0] > 0 and x.X.shape[1] > 0 and len(x.y) > 0]
+        if not items:
+            continue
+
         if len(items) == 1:
             out.append(items[0])
             continue
@@ -819,6 +994,10 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
 
         common = list(set(items[0].channel_names).intersection(*[set(x.channel_names) for x in items[1:]]))
         common = sorted(common, key=lambda c: items[0].channel_names.index(c))
+        if not common:
+            # No common channels: use the first item only to avoid shape mismatch
+            out.append(items[0])
+            continue
         aligned_X = []
         aligned_y = []
         aligned_cycle = []
@@ -842,6 +1021,21 @@ def _merge_subject_datasets(subjects: List[SubjectDataset]) -> List[SubjectDatas
         gait_percent = np.concatenate(aligned_gait) if aligned_gait else None
         sample_index = np.concatenate(aligned_idx) if aligned_idx else None
         out.append(SubjectDataset(subject_id, X, y, common, cycle_id, gait_percent, sample_index, items[0].source_file, metadata))
+
+    # Final invariant: verify len(X)==len(y) and consistent feature dims for all subjects
+    feature_dims = set()
+    for s in out:
+        if s.X.shape[0] != len(s.y):
+            raise ValueError(
+                f"Subject {s.subject_id!r}: len(X)={s.X.shape[0]} != len(y)={len(s.y)}"
+            )
+        feature_dims.add(s.X.shape[1])
+    if len(feature_dims) > 1:
+        raise ValueError(
+            f"Inconsistent feature dimensions across subjects: {feature_dims}. "
+            "All subjects must have the same X.shape[1]."
+        )
+
     return out
 
 
